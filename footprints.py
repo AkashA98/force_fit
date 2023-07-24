@@ -78,10 +78,15 @@ def get_vast_pointings(basepath):
         )
         all_paths.append(p)
         all_wcs.append(wcs)
-        all_centers.append(center)
+        all_centers.append([center.ra.degree, center.dec.degree])
         hdu.close()
 
-    return np.array(all_centers), np.array(all_wcs), np.array(paths)
+    all_centers = np.array(all_centers)
+    all_centers = SkyCoord(
+        ra=all_centers[:, 0] * u.degree, dec=all_centers[:, 1] * u.degree
+    )
+
+    return all_centers, np.array(all_wcs), np.array(paths)
 
 
 def pickle_pointing_info(epochs):
@@ -114,3 +119,69 @@ def pickle_pointing_info(epochs):
             f.close()
 
     return None
+
+
+def get_correct_file(epoch: str, p: astropy.coordinates.sky_coordinate.SkyCoord):
+    """
+    Function to return the image files that have the given source
+    coordinates. Read the pickle files and get the info
+    """
+    # First parse the epoch name correctly
+    epoch = "EPOCH" + epoch.rjust(2, "0")
+    with open(f"pickles/{epoch}.pkl", "rb") as f:
+        epoch_pkl = pickle.load(f)
+        f.close
+
+    # First filter out files that are within 10 degrees to cut
+    # short the computation
+    centers = epoch_pkl["centers"]
+    centers_sep = p.separation(centers).degree
+    mask = centers_sep < 10
+
+    num_files = 0
+    all_files = {}
+
+    primary_field = None
+    primary_field_sep = 10
+
+    for i, path in enumerate(epoch_pkl["paths"][mask]):
+        w = epoch_pkl["wcs"][mask][i]
+        source_pix = np.array(w.celestial.world_to_pixel(p))
+        ref_pix = w.celestial.wcs.crpix
+
+        if np.all(source_pix - 1.8 * ref_pix <= 0) and np.all(source_pix > 0):
+            field_name = [
+                i
+                for i in path.split("/")[-1].split(".")
+                if (("RACS" in i) or ("VAST" in i))
+            ][0]
+            try:
+                all_files[field_name].append(path)
+            except KeyError:
+                all_files[field_name] = [path]
+
+            num_files += 1
+        else:
+            continue
+
+        # Check if it is primary field or not
+        if centers_sep[mask][i] <= primary_field_sep:
+            primary_field = field_name
+            primary_field_sep = centers_sep[mask][i]
+
+    # Now rewrite the dictionary into primary and other fields
+    if num_files > 0:
+        match_files = {}
+        match_files["primary"] = all_files[primary_field]
+        for i in list(all_files.keys()):
+            if i != primary_field:
+                try:
+                    match_files["other"] = np.concatenate(
+                        (match_files["other"], all_files[i])
+                    )
+                except KeyError:
+                    match_files["other"] = all_files[i]
+
+        return match_files
+    else:
+        return None
