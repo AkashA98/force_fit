@@ -1,9 +1,11 @@
 import numpy as np
+from loguru import logger
+from astropy.wcs import WCS
 from astropy import units as u
 from lmfit import Model, create_params
 
-nan_mask_value = 1e8
 fwhm_to_sig = np.sqrt(8 * np.log(2))
+nan_mask_value = 1e8
 
 
 def gaussian_kernel(X, A, x0, y0, sx, sy, pa):
@@ -24,169 +26,212 @@ def gaussian_kernel(X, A, x0, y0, sx, sy, pa):
     return np.ravel(A * np.exp(power))
 
 
-def get_psf_info(hdr):
-    """
-    Function to get the information abou the point-spread function
-    """
-    try:
-        bmaj_pix = abs(hdr["BMAJ"] / hdr["CDELT1"]) / fwhm_to_sig
-        bmin_pix = abs(hdr["BMIN"] / hdr["CDELT2"]) / fwhm_to_sig
-    except KeyError:
-        bmaj_pix = abs(hdr["BMAJ"] / hdr["CD1_1"]) / fwhm_to_sig
-        bmin_pix = abs(hdr["BMIN"] / hdr["CD2_2"]) / fwhm_to_sig
-    pos_ang = hdr["BPA"] * u.degree
+class fitter:
+    """A fitter class that does the 2D gaussian fitting"""
 
-    return bmaj_pix, bmin_pix, pos_ang
+    def __init__(self, data, bkg, rms, wcs, meta, coords) -> None:
+        """Intialize a fitter class. Takes the image, bkg, rms data
+        as inputs along with the header that has the metadata
 
+        Args:
+            data (ndarray): image data
+            bkg (ndarray): mean map (background data)
+            rms (ndarray): noise map (rms data)
+            meta (astropy.io.fits.header.Header): header of the image
+            coords (astropy.coordinates.sky_coordinate.SkyCoord): source coordinates
+        """
 
-def get_forced_flux(data_im, hdr, data_rms, data_bkg):
-    """
-    Function to get the forced flux instead of fitting the position.
-    Similar to the Kaplan+Andrew force fitting routine.
-    """
-    data = np.copy(data_im)
+        self.image = data
+        self.bkg = bkg
+        self.bkg_flag = False if bkg is None else True
+        self.rms = rms
+        self.rms_flag = False if rms is None else True
+        self.hdr = meta
+        self.wcs = wcs
+        self.coords = coords
+        center = self.wcs.world_to_pixel(self.coords)
+        self.center = np.round(np.array(center), 0).astype(int)
 
-    # Make a pixel grid for the image
-    x, y = np.arange(len(data)), np.arange(len(data[0]))
-    X, Y = np.meshgrid(x, y)
-    sx, sy, pa = get_psf_info(hdr=hdr)
-    norm = 1  # snp.cos(2 * pa) / 2 / np.pi / sx / sy
-    kernel = gaussian_kernel(
-        (X, Y), norm, data.shape[0] / 2, data.shape[1] / 2, sx, sy, pa
-    )
+        hdr = self.hdr
+        if hdr["BUNIT"] == "Jy/beam":
+            logger.info("Given fluxes are in Jy, converting them to mJy")
+            self.fac = 1000
+        else:
+            self.fac = 1
 
-    # Do a noise weighted sum
-    flux = ((data - data_bkg) * kernel / data_rms**2).sum() / (
-        kernel**2 / data_rms**2
-    ).sum()
-    flux_err = ((data_rms) * kernel / data_rms**2).sum() / (
-        kernel / data_rms**2
-    ).sum()
+        if np.all(np.isnan(data)):
+            logger.error("All input data are NaN's, so doing nothing.")
+            raise Exception("The given file has no good data")
 
-    return flux, flux_err
+        # Correct the data for nan's
+        # Handle nan values. This is a bad way of handling nan values
+        # but currently the only way
+        self.image[np.isnan(self.image)] = 0
+        self.image *= self.fac
 
+        # Do the same for noise data
+        if not self.bkg_flag:
+            logger.warning("No background data provided, so assuming mean map is 0")
+            self.bkg = np.zeros_like(self.image)
+        else:
+            # Deal with nan values again
+            self.bkg[np.isnan(self.bkg)] = 0
+            self.bkg *= self.fac
 
-def calculate_errors(hdr, data, fit, rms_data=None):
-    """
-    Function to calculate fit errors according to Condon 1997
-    """
-    bmaj_pix, bmin_pix, _ = get_psf_info(hdr=hdr)
+        if not self.rms_flag:
+            logger.warning("No RMS data provided, assuming equal weights -- 1 mJy")
+            self.rms = np.ones_like(data) * 0.001
+        else:
+            # Set nan values in rms map so high, that weight is 0
+            self.rms[np.isnan(self.rms)] = nan_mask_value
+            self.rms *= self.fac
 
-    # Now calculate errors using eqn 41 of Condon 1997
-    _, x0, y0, sx, sy, _ = fit
-    snr_2_c1 = sx * sy / (4 * bmaj_pix * bmin_pix)
-    snr_2_c2 = 1 + (bmaj_pix * bmin_pix / (sx**2))
-    snr_2_c3 = 1 + (bmaj_pix * bmin_pix / (sy**2))
+    def _get_psf_info(self):
+        """
+        Function to get the information about the point-spread function
+        """
+        hdr = self.hdr
+        try:
+            self.pix_scl1 = abs(hdr["CDELT1"])
+            self.pix_scl2 = abs(hdr["CDELT2"])
+        except KeyError:
+            self.pix_scl1 = abs(hdr["CD1_1"])
+            self.pix_scl2 = abs(hdr["CD2_2"])
 
-    # estimate RMS of the image
-    if (x0 > len(data)) or (y0 > len(data[0])):
-        mu = np.nan
-        print("Something wrong with the source fitting, the Gaussian is out of bounds")
-    elif rms_data is not None:
-        mu = rms_data[int(len(rms_data) // 2), int(len(rms_data[0]) // 2)]
-    else:
-        mu = get_rms_from_image(data=data)
+        self.bmaj = abs(hdr["BMAJ"])
+        self.bmin = abs(hdr["BMIN"])
 
-    snr_2 = snr_2_c1 * (snr_2_c2 ** (1.5)) * (snr_2_c3 ** (1.5)) / (mu**2)
-    amp_err = np.sqrt(2 / snr_2)
+        self.bmaj_pix = abs(hdr["BMAJ"]) / self.pix_scl1
+        self.bmin_pix = abs(hdr["BMIN"]) / self.pix_scl2
 
-    return mu, amp_err
+        self.pos_ang = hdr["BPA"] * u.degree
 
+    def get_rms_from_image(self):
+        # Calculate errors from the image itself
+        # Since there is no error map, calculate by hand
+        data = self.image
+        l = len(data)
+        rms1 = np.nanstd(data[0 : l // 2 - 10, 0 : l // 2 - 10])
+        rms2 = np.nanstd(data[0 : l // 2 - 10, l // 2 + 10 : l])
+        rms3 = np.nanstd(data[l // 2 + 10 : l, 0 : l // 2 - 10])
+        rms4 = np.nanstd(data[l // 2 + 10 : l, l // 2 + 10 : l])
+        rms = 0.25 * (rms1 + rms2 + rms3 + rms4)
+        return rms
 
-def convert_fit_values_to_astrometric(fit, wcs, hdr):
-    """
-    Convert from pixel space to astrometric space
-    """
-    _, x0, y0, sx, sy, _ = fit
-    pos = wcs.celestial.pixel_to_world([x0], [y0])
-    maj = np.max([sx, sy])
-    minor = np.min([sx, sy])
-    try:
-        pix_scl_maj = hdr["CDELT1"]
-        pix_scl_min = hdr["CDELT2"]
-    except KeyError:
-        pix_scl_maj = hdr["CD1_1"]
-        pix_scl_min = hdr["CD2_2"]
-    fwhm_maj = maj * pix_scl_maj * fwhm_to_sig
-    fwhm_min = minor * pix_scl_min * fwhm_to_sig
+    def calculate_errors(self):
+        """
+        Function to calculate fit errors according eqn 41 of Condon 1997
+        """
 
-    return pos, fwhm_maj, fwhm_min
+        _, _, _, sx, sy, _ = self.fit
+        sx, sy = sx * fwhm_to_sig, sy * fwhm_to_sig
+        snr_2_c1 = sx * sy / (4 * self.bmaj_pix * self.bmin_pix)
+        snr_2_c2 = 1 + (self.bmaj_pix * self.bmin_pix / (sx**2))
+        snr_2_c3 = 1 + (self.bmaj_pix * self.bmin_pix / (sy**2))
 
+        # estimate RMS of the image
+        if self.rms_flag:
+            mu = self.rms[self.center[0], self.center[0]]
+        else:
+            mu = self.get_rms_from_image()
 
-def get_rms_from_image(data):
-    # Calculate errors from the image itself
-    # Since there is no error map, calculate by hand
-    l = len(data)
-    rms1 = np.nanstd(data[0 : l // 2 - 10, 0 : l // 2 - 10])
-    rms2 = np.nanstd(data[0 : l // 2 - 10, l // 2 + 10 : l])
-    rms3 = np.nanstd(data[l // 2 + 10 : l, 0 : l // 2 - 10])
-    rms4 = np.nanstd(data[l // 2 + 10 : l, l // 2 + 10 : l])
-    rms = 0.25 * (rms1 + rms2 + rms3 + rms4)
+        snr_2 = snr_2_c1 * (snr_2_c2 ** (1.5)) * (snr_2_c3 ** (1.5)) / (mu**2)
+        amp_err = np.sqrt(2 / snr_2)
 
-    return rms
+        self.rms_err = mu
+        self.condon_err = amp_err
 
+    def convert_fit_values_to_astrometric(self):
+        """
+        Convert from pixel space to astrometric space
+        """
+        _, x0, y0, sx, sy, pa = self.fit
+        pos = self.wcs.celestial.pixel_to_world([x0], [y0])[0]
+        maj = np.max([sx, sy])
+        minor = np.min([sx, sy])
 
-def fit_gaussian(data_im, hdr, data_rms=None, data_bkg=None, search=True):
-    """
-    Do the 2D gaussian fitting using the lmfit package
-    """
+        fwhm_maj = maj * self.pix_scl1 * fwhm_to_sig
+        fwhm_min = minor * self.pix_scl2 * fwhm_to_sig
 
-    data = np.copy(data_im)
+        self.fit_pos = pos
+        self.fit_shape = np.array([fwhm_maj, fwhm_min, pa])
 
-    # Make a pixel grid for the image
-    x, y = np.arange(len(data)), np.arange(len(data[0]))
-    X, Y = np.meshgrid(x, y)
+    def get_forced_flux(self):
+        """
+        Function to get the forced flux instead of fitting the position.
+        Similar to the Kaplan+Andrew force fitting routine.
+        """
+        data = np.copy(self.image)
 
-    # Make an initial guess and the bounds for the parameters
-    # Source will always be at the center of the data
-    data_max = np.max(np.abs(data))
-    if (
-        np.mean(
-            data[
-                data.shape[0] // 2 - 2 : data.shape[0] // 2 + 3,
-                data.shape[1] // 2 - 2 : data.shape[1] // 2 + 3,
-            ]
+        # Make a pixel grid for the image
+        x, y = np.arange(len(data)), np.arange(len(data[0]))
+        X, Y = np.meshgrid(x, y)
+        sx, sy, pa = (
+            self.bmaj_pix / fwhm_to_sig,
+            self.bmin_pix / fwhm_to_sig,
+            self.pos_ang,
         )
-        < 0
-    ):
-        p0 = (-data_max, len(data) / 2, len(data[0]) / 2, 1, 1, 45)
-    else:
-        p0 = (data_max, len(data) / 2, len(data[0]) / 2, 1, 1, 45)
-    pmax = (2 * data_max, len(data) / 2 + 2, len(data[0]) / 2 + 2, 3, 3, 360)
-    pmin = (-2 * data_max, len(data) / 2 - 2, len(data[0]) / 2 - 2, 0, 0, 0)
-
-    # Correct the data for nan's
-    # Handle nan values. This is a bad way of handling nan values
-    # but currently the only way
-    data[np.isnan(data)] = 0
-
-    # Do the same for noise data
-    if data_bkg is None:
-        data_bkg = np.zeros_like(data)
-    else:
-        # Deal with nan values again
-        data_bkg[np.isnan(data_bkg)] = 0
-
-    sub_data = data - data_bkg
-
-    if data_rms is None:
-        data_rms = np.ones_like(data)
-    else:
-        # Set nan values in rms map so high, that weight is 0
-        data_rms[np.isnan(data_rms)] = nan_mask_value
-
-    # Dont fit anything if the data is nan
-    if np.sum(np.abs(data)) == 0:
-        return (
-            (X, Y),
-            None,
-            np.ones_like(X) * np.nan,
-            np.zeros_like(p0) * np.nan,
-            np.zeros_like(p0),
+        norm = 1  # snp.cos(2 * pa) / 2 / np.pi / sx / sy
+        kernel = gaussian_kernel(
+            (X, Y), norm, self.center[0], self.center[1], sx, sy, pa
         )
-    else:
+
+        # Do a noise weighted sum
+        flux = np.nansum((data - self.bkg) * kernel / self.rms**2) / np.nansum(
+            kernel**2 / self.rms**2
+        )
+        flux_err = np.nansum((self.rms) * kernel / self.rms**2) / np.nansum(
+            kernel / self.rms**2
+        )
+
+        return flux, flux_err
+
+    def fit_gaussian(self, search=True):
+        """
+        Do the 2D gaussian fitting using the lmfit package
+        """
+
+        data = np.copy(self.image)
+        bkg_data = np.copy(self.bkg)
+        rms_data = np.copy(self.rms)
+        sub_data = data - bkg_data
+
+        self._get_psf_info()  # get the beam info
+
+        # Make a pixel grid for the image
+        x, y = np.arange(len(data)), np.arange(len(data[0]))
+        X, Y = np.meshgrid(x, y)
+        self.grid = (X, Y)
+
+        center = self.center
+        # Make an initial guess and the bounds for the parameters
+        # Source will always be at the center of the data
+        data_max = np.max(np.abs(data))
+        peak_value = np.mean(
+            data[center[0] - 1 : center[0] + 2, center[1] - 1 : center[1] + 1]
+        )
+        p0 = (peak_value, center[0], center[1], 1, 1, 45)
+        pmax = (
+            2 * data_max,
+            center[0] + self.bmaj_pix,
+            center[1] + self.bmaj_pix,
+            2 * self.bmaj_pix,
+            2 * self.bmin_pix,
+            360,
+        )
+        pmin = (
+            -2 * data_max,
+            center[0] - self.bmaj_pix,
+            center[1] - self.bmaj_pix,
+            0.25 * self.bmaj_pix,
+            0.25 * self.bmin_pix,
+            0,
+        )
+
         # decide whether to search around or not
         if search:
+            self.fit_success = False
+            logger.info("Fitting for position as well as the flux")
             # Fit it using lmfit
             fmodel = Model(gaussian_kernel, independent_vars=("X"))
 
@@ -200,45 +245,75 @@ def fit_gaussian(data_im, hdr, data_rms=None, data_bkg=None, search=True):
             )
 
             res = fmodel.fit(
-                np.ravel(sub_data), params, X=(X, Y), weights=1 / np.ravel(data_rms)
+                np.ravel(sub_data),
+                params,
+                X=(X, Y),
+                weights=1 / np.ravel(rms_data),
             )
 
-            fit_success = [True if res.summary()["ier"] <= 1 else False][0]
+            self.res = res
+
+            fit_success = (1 <= res.summary()["ier"] <= 4) and (
+                res.summary()["success"]
+            )
 
             if fit_success:
+                self.fit_success = True
+                logger.info("Fit is success")
                 # This means that the fit has converged and is successful
                 fit_values = np.array(list(res.best_values.values()))
                 fit_errs = np.sqrt(np.diag(res.covar))
-                if data_rms is None:
-                    rms, condon_err = calculate_errors(hdr, data, fit_values)
-                else:
-                    rms, condon_err = calculate_errors(
-                        hdr, data, fit_values, rms_data=data_rms
-                    )
-            else:
+
+                self.fit = fit_values
+                self.fit_err = fit_errs
+
+                self.calculate_errors()
+                self.convert_fit_values_to_astrometric()
+                logger.info(
+                    f"""A component is fit {np.round(self.fit_pos.separation(self.coords).arcsec, 2)}
+                    arcsec away from the requested coordinates, with a peak flux of {fit_values[0]} +/- 
+                    {self.rms_err} mJy, translating to an SNR of {fit_values[0]/self.rms_err}.
+                    """
+                )
+
+        if (not search) or (not self.fit_success):
+            if not self.fit_success:
                 # If not the fit has failed to converge, so then
                 # do a beam average of the flux and err
-                flux, rms = get_forced_flux(
-                    data_im=data, hdr=hdr, data_bkg=data_bkg, data_rms=data_rms
-                )
-                sx, sy, pa = get_psf_info(hdr=hdr)
-                fit_values = np.array(
-                    [flux, data.shape[0] / 2, data.shape[1] / 2, sx, sy, pa]
-                )
-                fit_errs = np.array([rms, np.nan, np.nan, np.nan, np.nan, np.nan])
-                condon_err = None
-        else:
+                logger.warning("Fit failed to converge")
+            if not search:
+                logger.info("Fitting for just the flux at the given position")
             # do a beam average of the flux and err
-            flux, rms = get_forced_flux(
-                data_im=data, hdr=hdr, data_bkg=data_bkg, data_rms=data_rms
-            )
-            sx, sy, pa = get_psf_info(hdr=hdr)
-            fit_values = np.array(
-                [flux, data.shape[0] / 2, data.shape[1] / 2, sx, sy, pa]
-            )
-            fit_errs = np.array([rms, np.nan, np.nan, np.nan, np.nan, np.nan])
-            condon_err = None
+            if self.rms_flag:
+                logger.info("Doing a simple forced fit for the given position")
+                flux, flux_err = self.get_forced_flux()
+                self.fit = np.array(
+                    [
+                        flux,
+                        self.center[0],
+                        self.center[1],
+                        self.bmaj_pix / fwhm_to_sig,
+                        self.bmin_pix / fwhm_to_sig,
+                        self.pos_ang,
+                    ]
+                )
+                self.fit_err = np.array(
+                    [flux_err, np.nan, np.nan, np.nan, np.nan, np.nan]
+                )
+            else:
+                logger.info(
+                    "No RMS data is given, so simply giving the flux at the position\
+                    and the RMS calculated from the image itself"
+                )
+                self.fit = [
+                    data[center[0], center[1]],
+                    self.center[0],
+                    self.center[1],
+                    self.bmaj_pix / fwhm_to_sig,
+                    self.bmin_pix / fwhm_to_sig,
+                    self.pos_ang,
+                ]
+                rms = self.get_rms_from_image()
+                self.fit_err = [rms, np.nan, np.nan, np.nan, np.nan, np.nan]
 
-        model = fmodel.func((X, Y), **fit_values).reshape(X.shape)
-
-        return (X, Y), model, fit_values, fit_errs, condon_err
+        self.psf_model = fmodel.func((X, Y), *self.fit).reshape(X.shape)

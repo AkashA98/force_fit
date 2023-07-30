@@ -3,63 +3,138 @@ import glob
 import pickle
 import astropy
 import warnings
-from astropy.wcs import WCS
 import numpy as np
+from loguru import logger
+from astropy.wcs import WCS
 from astropy.io import fits
-from astropy.coordinates import SkyCoord
 from astropy import units as u
+from astropy.coordinates import SkyCoord
 
 warnings.filterwarnings(
     action="ignore", category=astropy.wcs.FITSFixedWarning, module="astropy"
 )
 
 
-def validate_epochs(epochs):
+class vast_footprint:
     """
-    Validate a given set of epochs. The epoch names provided
-    will be of the form epoch_xx
+    Class that takes care of the VAST footprints
     """
-    names = [i.split("_")[-1] for i in epochs]
-    proper_names = ["EPOCH" + i.rjust(2, "0") for i in names]
-    proper_names[proper_names.index("EPOCH14")] = "EPOCH29"
 
-    # Check for valid epochs
-    mask = []
-    for n in names:
-        try:
-            intn = int(n)
-            mask.append(1)
-        except ValueError:
-            mask.append(0)
-    mask = np.array(mask, dtype=bool)
-    return mask, np.array(proper_names)
+    def __init__(self, stokes="I") -> None:
+        """Initialize a the class tha reads all the epochs
 
+        Args:
+            stokes (str, optional): sotesk parameter to search for.
+            Defaults to "I". Can give "I" or "V".
 
-def fetch_epochs():
-    """
-    Function to fetch all the epochs in the vast data
-    """
-    root_dir = "/data/vast-survey/VAST/vast-data/TILES/STOKESI_IMAGES/"
-    epochs_dir = np.array(glob.glob(root_dir + "/*"))
-    epoch_names = [i.split("/")[-1] for i in epochs_dir]
-    epoch_mask, alt_names = validate_epochs(epoch_names)
+        Returns:
+            None : None
+        """
+        self.vast_root = (
+            f"/data/vast-survey/VAST/vast-data/TILES/STOKES{stokes}_IMAGES/"
+        )
+        self.vast_rms_path = (
+            f"/data/vast-survey/VAST/vast-data/TILES/STOKES{stokes}_IMAGES/"
+        )
+        self.racs_root = "/data/vast-survey/RACS/release-format/"
+        self.racs_tail = f"/TILES/STOKES{stokes}_IMAGES/"
+        self.racs_rms_tail = f"/TILES/STOKES{stokes}_BANE/"
+        self.racs_epochs = ["EPOCH00", "EPOCH29"]
+        self.stokes = stokes
 
-    order_mask = np.argsort(alt_names[epoch_mask])
-    epochs = dict(
-        zip(alt_names[epoch_mask][order_mask], epochs_dir[epoch_mask][order_mask])
-    )
+        return None
 
-    # Modify the input directories for RACS
-    epochs[
-        "EPOCH00"
-    ] = "/data/vast-survey/RACS/release-format/EPOCH00/TILES/STOKESI_IMAGES/"
-    epochs[
-        "EPOCH29"
-    ] = "/data/vast-survey/RACS/release-format/EPOCH29/TILES/STOKESI_IMAGES/"
-    return epochs
+    def _fetch_epochs(self, rms=True):
+        """
+        Function to fetch all the epochs in the vast data
+
+        Returns:
+        dict: dictionary of all the epochs and their paths
+        """
+        epochs_dir = np.array(glob.glob(f"{self.vast_root}/*"))
+        epoch_names = np.array([i.split("/")[-1] for i in epochs_dir])
+        self.raw_epoch_names = epoch_names
+        logger.info(f"The following epochs are found: {epoch_names}")
+        self._validate_epochs()  # Removes all the rubbish epochs
+        logger.info(f"Removing the following epochs: {epoch_names[~self.epoch_mask]}")
+
+        order_mask = np.argsort(self.epoch_names)
+        epochs = dict(
+            zip(self.epoch_names[order_mask], epochs_dir[self.epoch_mask][order_mask])
+        )
+
+        all_files = {}
+        # Now assert for RMS MAPS
+        for e in list(epochs.keys()):
+            rmspath = epochs[e].replace(
+                f"STOKES{self.stokes}_IMAGES", f"STOKES{self.stokes}_RMSMAPS"
+            )
+            if os.path.isdir(rmspath):
+                all_files[e] = {"images": epochs[e], "rms": rmspath}
+            else:
+                all_files[e] = {"images": epochs[e], "rms": None}
+
+        self.epochs = all_files
+        logger.info("Asserting all the file paths")
+
+        # Modify the input directories for RACS
+        self._check_for_racs_epochs()  # change the paths for RACS epochs
+        self.epoch_names = np.array(list(self.epochs.keys()))
+
+        return None
+
+    def _validate_epochs(self):
+        """Validate a given set of epochs. The epoch names provided
+        will be of the form epoch_xx
+
+        Returns:
+            array, array: boolean mask of legitimate epochs, epochs renamed
+        """
+        names = [i.split("_")[-1] for i in self.raw_epoch_names]
+        proper_names = ["EPOCH" + i.rjust(2, "0") for i in names]
+
+        # Check for valid epochs
+        mask = []
+        for n in names:
+            try:
+                _ = int(n)
+                mask.append(1)
+            except ValueError:
+                mask.append(0)
+        mask = np.array(mask, dtype=bool)
+        self.epoch_mask = mask
+        self.epoch_names = np.array(proper_names)[mask]
+        return None
+
+    def _check_for_racs_epochs(self):
+        """
+        Check for the RACS epochs and get approriate file paths
+        """
+        for i in self.racs_epochs:
+            racs_path = f"{self.racs_root}{i}{self.racs_tail}"
+            racs_rms_path = f"{self.racs_root}{i}{self.racs_rms_tail}"
+            if os.path.isdir(racs_path):
+                d = {
+                    "images": racs_path,
+                    "rms": racs_rms_path if os.path.isdir(racs_rms_path) else None,
+                }
+                self.epochs[i] = d
+                logger.info(f"Adding the following RACS epoch: {i}")
+        return None
 
 
 def get_vast_pointings(basepath):
+    """Function to get the information about all the files in a given path
+
+    Args:
+        basepath (str): The base folder for all the image fits files
+
+    Returns:
+        array: An array of all the centers
+        array: An array of all the WCS objects
+        array: An array of all the paths to the files
+    """
+    # Now get info for the required epochs
     paths = glob.glob(f"{basepath}/*.fits")
     paths.sort()
 
@@ -89,46 +164,66 @@ def get_vast_pointings(basepath):
     return all_centers, np.array(all_wcs), np.array(paths)
 
 
-def pickle_pointing_info(epochs):
-    """
-    Generate pickle files about the individual tiles and their
+def pickle_pointing_info(vast):
+    """Generate pickle files about the individual tiles and their
     pointings for all the epochs
+
+    Args:
+        vast (class): The vast_footprint class object
+
+    Returns:
+        None: None
     """
-    epoch_names = np.array(list(epochs.keys()))
+    epoch_names = vast.epoch_names
     mask = np.ones(len(epoch_names)).astype(bool)
     # Pickle them all
-    if not os.path.isdir("pickles/"):
-        os.mkdir("pickles/")
+    if not os.path.isdir(f"pickles_{vast.stokes}/"):
+        os.mkdir(f"pickles_{vast.stokes}/")
+        mask = ~mask
+        logger.info(f"Making a pickle directory: pickles_{vast.stokes}/")
+        logger.info("There are no pickle files, so making all of them")
     else:
         for i, e in enumerate(epoch_names):
-            if os.path.isfile(f"pickles/{e}.pkl"):
+            if os.path.isfile(f"pickles_{vast.stokes}/{e}.pkl"):
                 continue
             else:
                 mask[i] &= False
+        logger.info(
+            f"Pickle files for the follwoing epochs are missing: {epoch_names[~mask]}"
+        )
 
     # For epochs that are missing, write put the pickle files
     for e in epoch_names[~mask]:
-        epoch_pontings = {}
-        centers, wcs, paths = get_vast_pointings(epochs[e])
-        epoch_pontings["centers"] = centers
-        epoch_pontings["wcs"] = wcs
-        epoch_pontings["paths"] = paths
+        centers, wcs, paths = get_vast_pointings(vast.epochs[e]["images"])
+        epoch_pointings = {"centers": centers, "wcs": wcs, "paths": paths}
 
-        with open(f"pickles/{e}.pkl", "wb") as f:
-            pickle.dump(epoch_pontings, f)
+        with open(f"pickles_{vast.stokes}/{e}.pkl", "wb") as f:
+            pickle.dump(epoch_pointings, f)
+            logger.info(
+                f"Making pickle files for the epoch {e}: pickles_{vast.stokes}/{e}.pkl"
+            )
             f.close()
 
     return None
 
 
-def get_correct_file(epoch: str, p: astropy.coordinates.sky_coordinate.SkyCoord):
-    """
-    Function to return the image files that have the given source
+def get_correct_file(vast, epoch: str, p: astropy.coordinates.sky_coordinate.SkyCoord):
+    """Function to return the image files that have the given source
     coordinates. Read the pickle files and get the info
+
+    Args:
+        vast (class): vast_footprint class object
+        epoch (str): The epoch for which the files are searches
+        p (astropy.coordinates.sky_coordinate.SkyCoord): source coordinates
+
+    Returns:
+        dict: dictionary of matched files
     """
     # First parse the epoch name correctly
+    # logger.info(f"The follwoing coordinates are given {p.to_string('hmsdms')}")
     epoch = "EPOCH" + epoch.rjust(2, "0")
-    with open(f"pickles/{epoch}.pkl", "rb") as f:
+    logger.info(f"Searching for files in the epoch {epoch}")
+    with open(f"pickles_{vast.stokes}/{epoch}.pkl", "rb") as f:
         epoch_pkl = pickle.load(f)
         f.close
 
@@ -170,18 +265,29 @@ def get_correct_file(epoch: str, p: astropy.coordinates.sky_coordinate.SkyCoord)
             primary_field_sep = centers_sep[mask][i]
 
     # Now rewrite the dictionary into primary and other fields
+    match_files = {}
+    nfiles = 0
     if num_files > 0:
-        match_files = {}
+        match_files["primary_field"] = primary_field
         match_files["primary"] = all_files[primary_field]
+        nfiles += 1
+        logger.info(f"The primary filed for the epoch {epoch} is {primary_field}")
+        logger.info(
+            f"Distance from center in the primary filed {primary_field_sep} deg"
+        )
         for i in list(all_files.keys()):
             if i != primary_field:
+                nfiles += len(all_files[i])
                 try:
                     match_files["other"] = np.concatenate(
                         (match_files["other"], all_files[i])
                     )
                 except KeyError:
                     match_files["other"] = all_files[i]
-
-        return match_files
     else:
-        return None
+        match_files["primary"] = []
+
+    logger.info(
+        f"{nfiles} files found in total having the given position in their field"
+    )
+    return match_files

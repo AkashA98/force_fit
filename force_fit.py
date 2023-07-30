@@ -3,6 +3,7 @@ import astropy
 import argparse
 import warnings
 import numpy as np
+from loguru import logger
 from astropy.io import fits
 from astropy.wcs import WCS
 from astropy import units as u
@@ -11,188 +12,265 @@ from astropy.nddata import Cutout2D
 from matplotlib import pyplot as plt
 from astropy.coordinates import SkyCoord
 from matplotlib.backends.backend_pdf import PdfPages
-from footprints import get_correct_file, fetch_epochs
-from fitter import fit_gaussian, convert_fit_values_to_astrometric
+from footprints import vast_footprint, pickle_pointing_info, get_correct_file
+from fitter import fitter
 
 warnings.filterwarnings(
     action="ignore", category=astropy.wcs.FITSFixedWarning, module="astropy"
 )
 
 
-def get_cut_out_data(hdu, s, size=2 * u.arcmin):
+def validate_files(all_files):
+    """Helper function that asserts if the files are present in the paths
+
+    Args:
+        all_files (dict): Dictionary of all the files, epoch wise
+
+    Returns:
+        dict: Modified dictionary that returns images, bkg, rms files
     """
-    Helper function to get the cutout data of the main TILE image
-    """
-    w = WCS(hdu[0].header)
-    data = hdu[0].data
-    ind = w.celestial.world_to_pixel(s)
-
-    # Check the diemsions and flatten it
-    dim = data.ndim
-    if dim == 4:
-        data = data[0][0]
-    try:
-        cut_data = Cutout2D(
-            data, [int(ind[0].item()), int(ind[1].item())], wcs=w.celestial, size=size
-        )
-    except astropy.nddata.utils.NoOverlapError:
-        cut_data = None
-
-    return cut_data
-
-
-def save_cutout_image(cut_data, coord, plotfile, model=None, title=None):
-    """
-    Helper function to save the source finding image
-    """
-    plt.clf()
-    _, ax = plt.subplot(figsize=(8, 6), projection=cut_data.wcs)
-    ax.imshow(cut_data.data, aspect="auto", origin="lower", cmap="gray_r")
-    if model is not None:
-        X, Y, Z, levels = model
-        ax.contour(X, Y, Z, levels=levels, colors="r")
-    src_pos = cut_data.wcs.celestial.world_to_pixel(coord)
-    ax.plot(
-        [src_pos[0], src_pos[0]],
-        [src_pos[1] + 1, src_pos[1] + 2],
-        color="r",
-    )
-    ax.plot(
-        [src_pos[0], src_pos[0]],
-        [src_pos[1] - 2, src_pos[1] - 1],
-        color="r",
-    )
-    ax.plot(
-        [src_pos[0] - 2, src_pos[0] - 1],
-        [src_pos[1], src_pos[1]],
-        color="r",
-    )
-    ax.plot(
-        [src_pos[0] + 1, src_pos[0] + 2],
-        [src_pos[1], src_pos[1]],
-        color="r",
-    )
-    ax.tick_params(labelsize=15)
-    ax.grid(True, color="k", ls="--")
-    if title is None:
-        title = coord.to_string("hmsdms")
-    ax.set_title(title, fontsize=20)
-    ax.set_xlabel("RA", fontsize=20)
-    ax.set_ylabel("DEC", fontsize=20)
-    plotfile.savefig(bbox_inches="tight")
-    return plotfile
-
-
-def get_racs_flux(coord, epoch="all", path="./", size=2 * u.arcmin, save_images=True):
-    """
-    Function to do the main source finding and fitting
-    """
-
-    if epoch == "all":
-        epochs = fetch_epochs()
-        epoch_names = list(epochs.keys())
-
-    # Fetch all the files in all the epochs that have the source in
-    # their primary beam
-    all_files = []
-    racs = []
-    for e in epoch_names:
-        epoch_id = e[-2:]
-        match_files = get_correct_file(epoch_id, coord)
-        if match_files is not None:
-            all_files.append(match_files["primary"])
-            if epoch_id in ["00", "14", "29"]:
-                racs.append(True)
-            else:
-                racs.append(False)
-
-    if len(all_files) > 0:
-        res = []
-        for i, p in enumerate(all_files):
-            if racs[i]:
-                p_rms = p.replace("STOKESV_IMAGES", "STOKESV_RMSMAPS")
-                p_bkg = p_rms.replace(".fits", ".bkg.fits")
-                p_rms = p_rms.replace(".fits", ".rms.fits")
-            else:
-                p_rms = p.replace("STOKESI_IMAGES", "STOKESI_RMSMAPS")
-                p_bkg = p_rms.replace("VAST_", "meanMap.VAST_")
-                p_rms = p_rms.replace("VAST_", "noiseMap.VAST_")
-
-            hdu_im = fits.open(p)
-            cut_data_im = get_cut_out_data(hdu_im, coord, size=size)
-
-            rms_mask = 0
-
-            if os.path.isfile(p_bkg):
-                hdu_bkg = fits.open(p_bkg)
-                cut_data_bkg = get_cut_out_data(hdu_bkg, coord, size=size)
-            else:
-                rms_mask += 1
-
-            if os.path.isfile(p_rms):
-                hdu_rms = fits.open(p_rms)
-                cut_data_rms = get_cut_out_data(hdu_rms, coord, size=size)
-            else:
-                rms_mask += 1
-
-            if np.all(np.isnan(cut_data_im.data)):
-                return None
-            else:
-                # Do the actual fitting
-                if rms_mask != 0:
-                    X, model, fit_values, fit_errs, condon_err = fit_gaussian(
-                        cut_data_im.data
-                    )
-                else:
-                    X, model, fit_values, fit_errs, condon_err = fit_gaussian(
-                        cut_data_im.data, cut_data_rms.data, cut_data_bkg.data
-                    )
-                rms = fit_errs[0]
-                if condon_err is None:
-                    condon_err = np.nan
-                    snr = fit_values[0] / rms
-                else:
-                    snr = fit_values[0] / condon_err
-                pos, fwhm_maj, fwhm_min = convert_fit_values_to_astrometric(
-                    fit_values, cut_data_im.wcs, hdu_im[0].header
+    racs_epochs = ["EPOCH00", "EPOCH29"]
+    all_epochs = list(all_files.keys())
+    structured_files = {}
+    for e in all_epochs:
+        if len(all_files[e]["primary"]) > 0:
+            try:
+                image_files = np.concatenate(
+                    (all_files[e]["primary"], all_files[e]["other"])
                 )
+            except KeyError:
+                image_files = all_files[e]["primary"]
 
-                if save_images:
-                    # Do the plotting
-                    plotfile = PdfPages(f"{path}/{coord.to_string('hmsdms')}.pdf")
-                    title = f"Stokes I image : epoch {e}, {np.round(pos.separation(coord).arcsec, 2)} arcsec offset"
-                    levels = (
-                        np.array(
-                            [
-                                0.049787068367863944,
-                                0.1353352832366127,
-                                0.36787944117144233,
-                            ]
-                        )
-                        * fit_values[0]
-                    )
-                    if fit_values[0] < 0:
-                        levels = np.flip(levels)
-                    model = [X[0], X[1], model, levels]
-                    plotfile = save_cutout_image(
-                        cut_data_im, coord, plotfile, model=model, title=title
-                    )
-                res.append(
-                    [
-                        hdu_im[0].header["DATE-OBS"],
-                        fit_values[0] * 1000,
-                        rms * 1000,
-                        condon_err * 1000,
-                        snr,
-                        pos.separation(coord).acrsec,
-                    ]
+            bkg_files = []
+            rms_files = []
+            for f in image_files:
+                if e in racs_epochs:
+                    aux_file = f.replace("_IMAGES", "_BANE")
+                    bkg_file = aux_file.replace(".fits", "_bkg.fits")
+                    rms_file = aux_file.replace(".fits", "_rms.fits")
+                else:
+                    aux_file = f.replace("_IMAGES", "_RMSMAPS")
+                    bkg_file = aux_file.replace("image.", "meanMap.image.")
+                    rms_file = aux_file.replace("image.", "noiseMap.image.")
+                if not os.path.isfile(bkg_file):
+                    bkg_file = None
+                if not os.path.isfile(rms_file):
+                    rms_file = None
+                bkg_files.append(bkg_file)
+                rms_files.append(rms_file)
+            structured_files[e] = {
+                "primary_field": all_files[e]["primary_field"],
+                "images": image_files,
+                "bkg": bkg_files,
+                "rms": rms_files,
+            }
+    return structured_files
+
+
+class source:
+    """Source class that is created for a given target"""
+
+    def __init__(
+        self,
+        coords,
+        img_path,
+        bkg_path=None,
+        rms_path=None,
+        stokes="I",
+        size=2 * u.arcmin,
+        epoch="xx",
+    ):
+        """Takes the source coordinates as the input
+        Args:
+            coords (astropy.coordinates.sky_coordinate.SkyCoord): source coordinates
+            img_path (str): Path to the input image
+            bkg_path (str, optional): Path to the mean map. Defaults to None.
+            rms_path (str, optional): Path to the noise map. Defaults to None.
+            stokes (str, optional): Stokes parameter to search for. Defaults to "I".
+            size (astropy.units.quantity.Quantity, optional): Size of the cutout image
+                Defaults to 2*u.arcmin.
+            stokes (str, optional): _description_. Defaults to "I".
+            size (_type_, optional): _description_. Defaults to 2*u.arcmin.
+            epoch (str, optional): _description_. Defaults to "xx".
+
+        Raises:
+            Exception: _description_
+        """
+        self.coords = coords
+        self.stokes = stokes
+        self.size = size
+        self.epoch = epoch
+        self.image = img_path
+        self.bkg = bkg_path
+        self.rms = rms_path
+
+        self.image_hdu = fits.open(self.image)
+        self.image_hdr = self.image_hdu[0].header
+        self.image_wcs = WCS(self.image_hdr)
+        # Check of the required coordinates are inside the given file
+        if self.image_wcs.celestial.footprint_contains(self.coords):
+            self.image_data = self.image_hdu[0].data
+
+            logger.info(f"Reading the image file for {self.image}")
+
+            if self.bkg is None:
+                logger.warning(
+                    f"No background file is provided for the image {self.image}"
                 )
-        if len(res) > 0:
-            return res
+                self.bkg_data = None
+            else:
+                self.bkg_data = fits.getdata(self.bkg, 0)
+            if self.rms is None:
+                logger.warning(f"No RMS file is provided for the image {self.image}")
+                self.rms_data = None
+            else:
+                self.rms_data = fits.getdata(self.rms, 0)
         else:
-            return None
-    else:
-        return None
+            logger.error("The given file does not contain the source coordinates")
+            raise Exception("The given file does not contain the source coordinates")
+
+    def get_cut_out_data(self):
+        """Helper function to get the cutout data of the main TILE image"""
+
+        ind = self.image_wcs.celestial.world_to_pixel(self.coords)
+
+        # Check the diemsions and flatten it
+        dim = self.image_data.ndim
+        if dim == 2:
+            slc = (slice(None), slice(None))
+        else:
+            slc = [0] * (dim - 2)
+            slc += [slice(None), slice(None)]
+            slc = tuple(slc)
+        self.image_cut = Cutout2D(
+            self.image_data[slc],
+            [int(ind[0].item()), int(ind[1].item())],
+            wcs=self.image_wcs.celestial,
+            size=self.size,
+        )
+        if self.bkg_data is not None:
+            self.bkg_cut = Cutout2D(
+                self.bkg_data[slc],
+                [int(ind[0].item()), int(ind[1].item())],
+                wcs=self.image_wcs.celestial,
+                size=self.size,
+            )
+        else:
+            self.bkg_cut = None
+
+        if self.rms_data is not None:
+            self.rms_cut = Cutout2D(
+                self.rms_data[slc],
+                [int(ind[0].item()), int(ind[1].item())],
+                wcs=self.image_wcs.celestial,
+                size=self.size,
+            )
+        else:
+            self.rms_cut = None
+
+    def get_fluxes(self):
+        """Function that does the fitting and flux estimation"""
+        logger.info("Starting the source fitting")
+        if (self.bkg_cut is None) and (self.rms_cut is None):
+            fit = fitter(
+                self.image_cut.data,
+                None,
+                None,
+                self.image_cut.wcs,
+                self.image_hdr,
+                self.coords,
+            )
+        elif (self.bkg_cut is not None) and (self.rms_cut is None):
+            fit = fitter(
+                self.image_cut.data,
+                self.bkg_cut.data,
+                None,
+                self.image_cut.wcs,
+                self.image_hdr,
+                self.coords,
+            )
+        elif (self.bkg_cut is None) and (self.rms_cut is not None):
+            fit = fitter(
+                self.image_cut.data,
+                None,
+                self.rms_cut.data,
+                self.image_cut.wcs,
+                self.image_hdr,
+                self.coords,
+            )
+        else:
+            fit = fitter(
+                self.image_cut.data,
+                self.bkg_cut.data,
+                self.rms_cut.data,
+                self.image_cut.wcs,
+                self.image_hdr,
+                self.coords,
+            )
+        self.fit = fit
+        self.fit.fit_gaussian()
+
+    def save_cutout_image(self, plotfile=None):
+        """
+        Helper function to save the source finding image
+        """
+        plt.clf()
+        fig = plt.figure(figsize=(8, 6))
+        ax = fig.add_subplot(projection=self.image_cut.wcs)
+        ax.imshow(self.image_cut.data, aspect="auto", origin="lower", cmap="gray_r")
+        X, Y = self.fit.grid
+        Z = self.fit.psf_model
+        levels = np.array(
+            [0.049787068367863944, 0.1353352832366127, 0.36787944117144233]
+        )
+        ax.contour(X, Y, Z, levels=levels * self.fit.fit[0], colors="r")
+        src_pos = self.image_cut.wcs.celestial.world_to_pixel(self.coords)
+        ax.plot(
+            [src_pos[0], src_pos[0]],
+            [src_pos[1] + 1, src_pos[1] + 2],
+            color="r",
+        )
+        ax.plot(
+            [src_pos[0], src_pos[0]],
+            [src_pos[1] - 2, src_pos[1] - 1],
+            color="r",
+        )
+        ax.plot(
+            [src_pos[0] - 2, src_pos[0] - 1],
+            [src_pos[1], src_pos[1]],
+            color="r",
+        )
+        ax.plot(
+            [src_pos[0] + 1, src_pos[0] + 2],
+            [src_pos[1], src_pos[1]],
+            color="r",
+        )
+        ax.tick_params(labelsize=15)
+        ax.grid(True, color="k", ls="--")
+
+        offset = np.round(self.fit.fit_pos.separation(self.coords).arcsec, 2)
+        title = f"Stokes{self.stokes} image, epoch {self.epoch}, with {offset} arcsec offset"
+        ax.set_title(title, fontsize=20)
+        ax.set_xlabel("RA", fontsize=20)
+        ax.set_ylabel("DEC", fontsize=20)
+        if plotfile is None:
+            plt.show()
+        else:
+            plotfile.savefig(bbox_inches="tight")
+            plt.close("all")
+            return plotfile
+
+    def _clean(self):
+        """Close all the opened files and remove the ouput"""
+        self.image_hdu.close()
+        del (
+            self.image_cut,
+            self.bkg_cut,
+            self.rms_cut,
+            self.bkg_data,
+            self.rms_data,
+            self.fit,
+        )
 
 
 if __name__ == "__main__":
@@ -217,6 +295,13 @@ if __name__ == "__main__":
         default="all",
     )
     parser.add_argument(
+        "--stokes",
+        help="""Stokes parameter to search for, by default searches for "I".
+        Should be provoided in str format, for eg. "I", or "V" or "all".""",
+        type="str",
+        default="I",
+    )
+    parser.add_argument(
         "--outdir",
         help="""Output directory to save the plots/light curves to.
         Default is the current directory""",
@@ -231,4 +316,21 @@ if __name__ == "__main__":
         dtype=["U32", "U32", "f4", "f4", "f4", "f4", "f4", "f4"],
     )
 
-    res = get_racs_flux(args.coord, args.epoch, args.path)
+    # res = get_racs_flux(args.coord, args.epoch, args.path)
+
+    coord = SkyCoord(f"{args.coords[0]} {args.coords[1]}", unit=(u.hourangle, u.dgeree))
+
+    # First get all the vast epochs and files
+    vast = vast_footprint(stokes=args.stokes)
+    vast._fetch_epochs()  # Get all the epochs and their paths
+    pickle_pointing_info(vast)  # Update the pickle files
+
+    # Get all the files to search for
+    all_files = {}
+    for e in vast.epoch_names:
+        epoch_id = e[-2:]
+        files = get_correct_file(vast, e, coord)
+        all_files[e] = files
+
+    # Now create a source class
+    src = source(coords=coord, files=all_files)
