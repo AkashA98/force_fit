@@ -237,7 +237,7 @@ class source:
                 self.fit.fit[0],
                 self.fit.rms_err,
                 self.fit.condon_err,
-                self.fit.fit[0] / self.fit.rms_err,
+                np.abs(self.fit.fit[0] / self.fit.rms_err),
                 self.fit_offset,
             ]
         )
@@ -255,7 +255,11 @@ class source:
         levels = np.array(
             [0.049787068367863944, 0.1353352832366127, 0.36787944117144233]
         )
-        ax.contour(X, Y, Z, levels=levels * self.fit.fit[0], colors="r")
+        if self.fit.fit[0] < 0:
+            levels = self.fit.fit[0] * np.flip(levels)
+        else:
+            levels = levels * self.fit.fit[0]
+        ax.contour(X, Y, Z, levels=levels, colors="r")
         src_pos = self.image_cut.wcs.celestial.world_to_pixel(self.coords)
         ax.plot(
             [src_pos[0], src_pos[0]],

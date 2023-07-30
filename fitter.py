@@ -84,6 +84,7 @@ class fitter:
         else:
             # Set nan values in rms map so high, that weight is 0
             self.rms[np.isnan(self.rms)] = nan_mask_value
+            self.rms[self.rms == 0] = nan_mask_value
             self.rms *= self.fac
 
     def _get_psf_info(self):
@@ -274,7 +275,7 @@ class fitter:
                 logger.info(
                     f"""A component is fit {np.round(self.fit_pos.separation(self.coords).arcsec, 2)}
                     arcsec away from the requested coordinates, with a peak flux of {fit_values[0]} +/- 
-                    {self.rms_err} mJy, translating to an SNR of {fit_values[0]/self.rms_err}.
+                    {self.rms_err} mJy, translating to an SNR of {np.abs(fit_values[0]/self.rms_err)}.
                     """
                 )
 
