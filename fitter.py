@@ -61,7 +61,7 @@ class fitter:
 
         if np.all(np.isnan(data)):
             logger.error("All input data are NaN's, so doing nothing.")
-            raise Exception("The given file has no good data")
+            raise NotImplementedError("The given file has no good data")
 
         # Correct the data for nan's
         # Handle nan values. This is a bad way of handling nan values
@@ -175,7 +175,7 @@ class fitter:
         kernel = gaussian_kernel(
             (X, Y), norm, self.center[0], self.center[1], sx, sy, pa
         )
-
+        kernel = kernel.reshape(X.shape)
         # Do a noise weighted sum
         flux = np.nansum((data - self.bkg) * kernel / self.rms**2) / np.nansum(
             kernel**2 / self.rms**2
@@ -196,7 +196,7 @@ class fitter:
         rms_data = np.copy(self.rms)
         sub_data = data - bkg_data
 
-        self._get_psf_info()  # get the beam info
+        self._get_psf_info()
 
         # Make a pixel grid for the image
         x, y = np.arange(len(data)), np.arange(len(data[0]))
@@ -213,18 +213,18 @@ class fitter:
         p0 = (peak_value, center[0], center[1], 1, 1, 45)
         pmax = (
             2 * data_max,
-            center[0] + self.bmaj_pix,
-            center[1] + self.bmaj_pix,
-            2 * self.bmaj_pix,
-            2 * self.bmin_pix,
+            center[0] + self.bmaj_pix / fwhm_to_sig,
+            center[1] + self.bmaj_pix / fwhm_to_sig,
+            1.5 * self.bmaj_pix / fwhm_to_sig,
+            1.5 * self.bmin_pix / fwhm_to_sig,
             360,
         )
         pmin = (
             -2 * data_max,
-            center[0] - self.bmaj_pix,
-            center[1] - self.bmaj_pix,
-            0.25 * self.bmaj_pix,
-            0.25 * self.bmin_pix,
+            center[0] - self.bmaj_pix / fwhm_to_sig,
+            center[1] - self.bmaj_pix / fwhm_to_sig,
+            0,
+            0,
             0,
         )
 
@@ -253,8 +253,10 @@ class fitter:
 
             self.res = res
 
-            fit_success = (1 <= res.summary()["ier"] <= 4) and (
-                res.summary()["success"]
+            fit_success = (
+                (1 <= res.summary()["ier"] <= 4)
+                and (res.summary()["success"])
+                and ((res.covar is not None))
             )
 
             if fit_success:
@@ -294,12 +296,13 @@ class fitter:
                         self.center[1],
                         self.bmaj_pix / fwhm_to_sig,
                         self.bmin_pix / fwhm_to_sig,
-                        self.pos_ang,
+                        self.pos_ang.value,
                     ]
                 )
                 self.fit_err = np.array(
                     [flux_err, np.nan, np.nan, np.nan, np.nan, np.nan]
                 )
+                self.rms_err = flux_err
             else:
                 logger.info(
                     "No RMS data is given, so simply giving the flux at the position\
@@ -311,9 +314,13 @@ class fitter:
                     self.center[1],
                     self.bmaj_pix / fwhm_to_sig,
                     self.bmin_pix / fwhm_to_sig,
-                    self.pos_ang,
+                    self.pos_ang.value,
                 ]
                 rms = self.get_rms_from_image()
                 self.fit_err = [rms, np.nan, np.nan, np.nan, np.nan, np.nan]
+                self.rms_err = rms
+            self.condon_err = None
+            self.fit_pos = self.coords
+            self.fit_shape = np.array([self.bmaj, self.bmin, self.pos_ang.value])
 
         self.psf_model = fmodel.func((X, Y), *self.fit).reshape(X.shape)

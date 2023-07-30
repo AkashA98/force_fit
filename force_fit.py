@@ -70,9 +70,20 @@ def validate_files(all_files):
 class source:
     """Source class that is created for a given target"""
 
-    def __init__(
+    def __init__(self, coords) -> None:
+        """Takes the source coordinates as the input
+        Args:
+            coords (astropy.coordinates.sky_coordinate.SkyCoord): source coordinates
+        """
+        self.coords = coords
+        # Create a table to store the results
+        self.result = Table(
+            names=["date", "flux", "rms", "err", "snr", "sep"],
+            dtype=["U32", "f4", "f4", "f4", "f4", "f4"],
+        )
+
+    def _add_files(
         self,
-        coords,
         img_path,
         bkg_path=None,
         rms_path=None,
@@ -82,7 +93,6 @@ class source:
     ):
         """Takes the source coordinates as the input
         Args:
-            coords (astropy.coordinates.sky_coordinate.SkyCoord): source coordinates
             img_path (str): Path to the input image
             bkg_path (str, optional): Path to the mean map. Defaults to None.
             rms_path (str, optional): Path to the noise map. Defaults to None.
@@ -94,9 +104,9 @@ class source:
             epoch (str, optional): _description_. Defaults to "xx".
 
         Raises:
-            Exception: _description_
+            Exception: If the source coordinates are not in the given files
         """
-        self.coords = coords
+
         self.stokes = stokes
         self.size = size
         self.epoch = epoch
@@ -127,7 +137,9 @@ class source:
                 self.rms_data = fits.getdata(self.rms, 0)
         else:
             logger.error("The given file does not contain the source coordinates")
-            raise Exception("The given file does not contain the source coordinates")
+            raise NotImplementedError(
+                "The given file does not contain the source coordinates"
+            )
 
     def get_cut_out_data(self):
         """Helper function to get the cutout data of the main TILE image"""
@@ -136,12 +148,17 @@ class source:
 
         # Check the diemsions and flatten it
         dim = self.image_data.ndim
+        bkg_dim = self.bkg_data.ndim
         if dim == 2:
             slc = (slice(None), slice(None))
         else:
             slc = [0] * (dim - 2)
             slc += [slice(None), slice(None)]
             slc = tuple(slc)
+        if dim != bkg_dim:
+            bkg_slc = (slice(None), slice(None))
+        else:
+            bkg_slc = slc
         self.image_cut = Cutout2D(
             self.image_data[slc],
             [int(ind[0].item()), int(ind[1].item())],
@@ -150,7 +167,7 @@ class source:
         )
         if self.bkg_data is not None:
             self.bkg_cut = Cutout2D(
-                self.bkg_data[slc],
+                self.bkg_data[bkg_slc],
                 [int(ind[0].item()), int(ind[1].item())],
                 wcs=self.image_wcs.celestial,
                 size=self.size,
@@ -160,7 +177,7 @@ class source:
 
         if self.rms_data is not None:
             self.rms_cut = Cutout2D(
-                self.rms_data[slc],
+                self.rms_data[bkg_slc],
                 [int(ind[0].item()), int(ind[1].item())],
                 wcs=self.image_wcs.celestial,
                 size=self.size,
@@ -171,44 +188,59 @@ class source:
     def get_fluxes(self):
         """Function that does the fitting and flux estimation"""
         logger.info("Starting the source fitting")
-        if (self.bkg_cut is None) and (self.rms_cut is None):
-            fit = fitter(
-                self.image_cut.data,
-                None,
-                None,
-                self.image_cut.wcs,
-                self.image_hdr,
-                self.coords,
-            )
-        elif (self.bkg_cut is not None) and (self.rms_cut is None):
-            fit = fitter(
-                self.image_cut.data,
-                self.bkg_cut.data,
-                None,
-                self.image_cut.wcs,
-                self.image_hdr,
-                self.coords,
-            )
-        elif (self.bkg_cut is None) and (self.rms_cut is not None):
-            fit = fitter(
-                self.image_cut.data,
-                None,
-                self.rms_cut.data,
-                self.image_cut.wcs,
-                self.image_hdr,
-                self.coords,
-            )
-        else:
-            fit = fitter(
-                self.image_cut.data,
-                self.bkg_cut.data,
-                self.rms_cut.data,
-                self.image_cut.wcs,
-                self.image_hdr,
-                self.coords,
-            )
+        try:
+            if (self.bkg_cut is None) and (self.rms_cut is None):
+                fit = fitter(
+                    self.image_cut.data,
+                    None,
+                    None,
+                    self.image_cut.wcs,
+                    self.image_hdr,
+                    self.coords,
+                )
+            elif (self.bkg_cut is not None) and (self.rms_cut is None):
+                fit = fitter(
+                    self.image_cut.data,
+                    self.bkg_cut.data,
+                    None,
+                    self.image_cut.wcs,
+                    self.image_hdr,
+                    self.coords,
+                )
+            elif (self.bkg_cut is None) and (self.rms_cut is not None):
+                fit = fitter(
+                    self.image_cut.data,
+                    None,
+                    self.rms_cut.data,
+                    self.image_cut.wcs,
+                    self.image_hdr,
+                    self.coords,
+                )
+            else:
+                fit = fitter(
+                    self.image_cut.data,
+                    self.bkg_cut.data,
+                    self.rms_cut.data,
+                    self.image_cut.wcs,
+                    self.image_hdr,
+                    self.coords,
+                )
+        except NotImplementedError:
+            raise NotImplementedError("The given file has no good data")
         self.fit = fit
         self.fit.fit_gaussian()
+
+        self.fit_offset = np.round(self.fit.fit_pos.separation(self.coords).arcsec, 2)
+        self.result.add_row(
+            [
+                self.image_hdr["DATE"],
+                self.fit.fit[0],
+                self.fit.rms_err,
+                self.fit.condon_err,
+                self.fit.fit[0] / self.fit.rms_err,
+                self.fit_offset,
+            ]
+        )
 
     def save_cutout_image(self, plotfile=None):
         """
@@ -248,8 +280,7 @@ class source:
         ax.tick_params(labelsize=15)
         ax.grid(True, color="k", ls="--")
 
-        offset = np.round(self.fit.fit_pos.separation(self.coords).arcsec, 2)
-        title = f"Stokes{self.stokes} image, epoch {self.epoch}, with {offset} arcsec offset"
+        title = f"Stokes{self.stokes} image, epoch {self.epoch}, with {self.fit_offset} arcsec offset"
         ax.set_title(title, fontsize=20)
         ax.set_xlabel("RA", fontsize=20)
         ax.set_ylabel("DEC", fontsize=20)
@@ -265,6 +296,8 @@ class source:
         self.image_hdu.close()
         del (
             self.image_cut,
+            self.image_wcs,
+            self.image_hdr,
             self.bkg_cut,
             self.rms_cut,
             self.bkg_data,
@@ -311,13 +344,6 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    tab = Table(
-        names=["Name", "date", "flux", "rms", "err", "snr", "sep"],
-        dtype=["U32", "U32", "f4", "f4", "f4", "f4", "f4", "f4"],
-    )
-
-    # res = get_racs_flux(args.coord, args.epoch, args.path)
-
     coord = SkyCoord(f"{args.coords[0]} {args.coords[1]}", unit=(u.hourangle, u.dgeree))
 
     # First get all the vast epochs and files
@@ -332,5 +358,23 @@ if __name__ == "__main__":
         files = get_correct_file(vast, e, coord)
         all_files[e] = files
 
+    all_files = validate_files(all_files=all_files)
+    epochs = list(all_files.keys())
+
     # Now create a source class
-    src = source(coords=coord, files=all_files)
+    src = source(coords=coord)
+    plotfile = PdfPages(f"{coord.to_string('hmsdms')}.pdf")
+
+    for e in epochs:
+        epoch_files = all_files[e]
+        for i in range(len(epoch_files["images"])):
+            src._add_files(
+                epoch_files["images"][i],
+                bkg_path=epoch_files["bkg"][i],
+                rms_path=epoch_files["rms"][i],
+                epoch=e[-2:],
+            )
+            src.get_cut_out_data()
+            src.get_fluxes()
+            src.save_cutout_image(plotfile=plotfile)
+            src._clean
