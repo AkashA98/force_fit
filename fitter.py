@@ -1,6 +1,5 @@
 import numpy as np
 from loguru import logger
-from astropy.wcs import WCS
 from astropy import units as u
 from lmfit import Model, create_params
 
@@ -105,7 +104,7 @@ class fitter:
         self.bmaj_pix = abs(hdr["BMAJ"]) / self.pix_scl1
         self.bmin_pix = abs(hdr["BMIN"]) / self.pix_scl2
 
-        self.pos_ang = hdr["BPA"] * u.degree
+        self.pos_ang = hdr["BPA"] % 180
 
     def get_rms_from_image(self):
         # Calculate errors from the image itself
@@ -119,12 +118,12 @@ class fitter:
         rms = 0.25 * (rms1 + rms2 + rms3 + rms4)
         return rms
 
-    def calculate_errors(self):
+    def calculate_errors(self, fit):
         """
         Function to calculate fit errors according eqn 41 of Condon 1997
         """
 
-        _, _, _, sx, sy, _ = self.fit
+        _, _, _, sx, sy, _ = fit
         sx, sy = sx * fwhm_to_sig, sy * fwhm_to_sig
         snr_2_c1 = sx * sy / (4 * self.bmaj_pix * self.bmin_pix)
         snr_2_c2 = 1 + (self.bmaj_pix * self.bmin_pix / (sx**2))
@@ -156,6 +155,66 @@ class fitter:
 
         self.fit_pos = pos
         self.fit_shape = np.array([fwhm_maj, fwhm_min, pa])
+
+    def make_params(self, data, center):
+        """Helper function to make the fot parameters"""
+        data_max = np.max(np.abs(data))
+        peak_value = np.mean(
+            data[center[0] - 1 : center[0] + 2, center[1] - 1 : center[1] + 1]
+        )
+
+        sx = self.bmaj_pix / fwhm_to_sig
+        sy = self.bmin_pix / fwhm_to_sig
+        pa = self.pos_ang
+        p0 = (peak_value, center[0], center[1], sx, sy, pa)
+        pmax = (
+            2 * data_max,
+            center[0] + 2 * sx,
+            center[1] + 2 * sy,
+            1.5 * sx,
+            1.5 * sy,
+            180,
+        )
+        pmin = (
+            -2 * data_max,
+            center[0] - 2 * sx,
+            center[1] - 2 * sy,
+            0.5 * sx,
+            0.5 * sy,
+            0,
+        )
+
+        self.p0 = p0
+        self.p0_bounds = (np.array(pmin), np.array(pmax))
+
+        params = create_params(
+            A=dict(value=p0[0], min=pmin[0], max=pmax[0]),
+            x0=dict(value=p0[1], min=pmin[1], max=pmax[1]),
+            y0=dict(value=p0[2], min=pmin[2], max=pmax[2]),
+            sx=dict(value=p0[3], min=pmin[3], max=pmax[3]),
+            sy=dict(value=p0[4], min=pmin[4], max=pmax[4]),
+            pa=dict(value=p0[5], min=pmin[5], max=pmax[5]),
+        )
+        return params
+
+    def revise_params(self, fit, errs=None):
+        """Helper function to revise the fit."""
+        p0 = fit
+        if errs is None:
+            sx = self.bmaj_pix / fwhm_to_sig
+            sy = self.bmin_pix / fwhm_to_sig
+            pa = self.pos_ang
+            errs = np.array([0.25, sx, sy, np.sqrt(sx), np.sqrt(sy), pa])
+
+        params = create_params(
+            A=dict(value=p0[0], min=p0[0] - 2 * errs[0], max=p0[0] + 2 * errs[0]),
+            x0=dict(value=p0[1], min=p0[1] - 2 * errs[1], max=p0[1] + 2 * errs[1]),
+            y0=dict(value=p0[2], min=p0[2] - 2 * errs[2], max=p0[2] + 2 * errs[2]),
+            sx=dict(value=p0[3], min=p0[3] - 2 * errs[3], max=p0[3] + 2 * errs[3]),
+            sy=dict(value=p0[4], min=p0[4] - 2 * errs[4], max=p0[4] + 2 * errs[4]),
+            pa=dict(value=p0[5], min=p0[5] - 2 * errs[5], max=p0[5] + 2 * errs[5]),
+        )
+        return params
 
     def get_forced_flux(self):
         """
@@ -207,43 +266,15 @@ class fitter:
         center = self.center
         # Make an initial guess and the bounds for the parameters
         # Source will always be at the center of the data
-        data_max = np.max(np.abs(data))
-        peak_value = np.mean(
-            data[center[0] - 1 : center[0] + 2, center[1] - 1 : center[1] + 1]
-        )
-        p0 = (peak_value, center[0], center[1], 1, 1, 45)
-        pmax = (
-            2 * data_max,
-            center[0] + self.bmaj_pix / fwhm_to_sig,
-            center[1] + self.bmaj_pix / fwhm_to_sig,
-            1.5 * self.bmaj_pix / fwhm_to_sig,
-            1.5 * self.bmin_pix / fwhm_to_sig,
-            360,
-        )
-        pmin = (
-            -2 * data_max,
-            center[0] - self.bmaj_pix / fwhm_to_sig,
-            center[1] - self.bmaj_pix / fwhm_to_sig,
-            0,
-            0,
-            0,
-        )
 
         # decide whether to search around or not
+        self.fit_success = False
         if search:
-            self.fit_success = False
             logger.info("Fitting for position as well as the flux")
             # Fit it using lmfit
             fmodel = Model(gaussian_kernel, independent_vars=("X"))
 
-            params = create_params(
-                A=dict(value=p0[0], min=pmin[0], max=pmax[0]),
-                x0=dict(value=p0[1], min=pmin[1], max=pmax[1]),
-                y0=dict(value=p0[2], min=pmin[2], max=pmax[2]),
-                sx=dict(value=p0[3], min=pmin[3], max=pmax[3]),
-                sy=dict(value=p0[4], min=pmin[4], max=pmax[4]),
-                pa=dict(value=p0[5], min=pmin[5], max=pmax[5]),
-            )
+            params = self.make_params(data=sub_data, center=center)
 
             res = fmodel.fit(
                 np.ravel(sub_data),
@@ -252,25 +283,44 @@ class fitter:
                 weights=1 / np.ravel(rms_data),
             )
 
-            self.res = res
+            # try revising the fit (2 iterations)
+            niter = 0
+            while niter < 2:
+                if res.covar is None:
+                    errs = None
+                else:
+                    errs = np.sqrt(np.diag(res.covar))
+                new_params = self.revise_params(list(res.best_values.values()), errs)
+                logger.info(f"Updating fit -- trail {niter+1}/2")
+                res = fmodel.fit(
+                    np.ravel(sub_data),
+                    new_params,
+                    X=(X, Y),
+                    weights=1 / np.ravel(rms_data),
+                )
+                niter += 1
 
-            fit_success = (
-                (1 <= res.summary()["ier"] <= 4)
-                and (res.summary()["success"])
-                and ((res.covar is not None))
+            self.res = res
+            conv_success = (1 <= res.summary()["ier"] <= 4) and (
+                res.summary()["success"]
             )
+
+            covar_success = res.covar is not None
+            # Calculate errors
+            fit_values = np.array(list(res.best_values.values()))
+            self.calculate_errors(fit_values)
+            det_success = np.abs(fit_values[0] / self.rms_err) >= 3
+            fit_success = conv_success & covar_success & det_success
 
             if fit_success:
                 self.fit_success = True
                 logger.info("Fit is success")
                 # This means that the fit has converged and is successful
-                fit_values = np.array(list(res.best_values.values()))
                 fit_errs = np.sqrt(np.diag(res.covar))
 
                 self.fit = fit_values
                 self.fit_err = fit_errs
 
-                self.calculate_errors()
                 self.convert_fit_values_to_astrometric()
                 logger.info(
                     f"""A component is fit {np.round(self.fit_pos.separation(self.coords).arcsec, 2)}
@@ -297,7 +347,7 @@ class fitter:
                         self.center[1],
                         self.bmaj_pix / fwhm_to_sig,
                         self.bmin_pix / fwhm_to_sig,
-                        self.pos_ang.value,
+                        self.pos_ang,
                     ]
                 )
                 self.fit_err = np.array(
@@ -315,13 +365,13 @@ class fitter:
                     self.center[1],
                     self.bmaj_pix / fwhm_to_sig,
                     self.bmin_pix / fwhm_to_sig,
-                    self.pos_ang.value,
+                    self.pos_ang,
                 ]
                 rms = self.get_rms_from_image()
                 self.fit_err = [rms, np.nan, np.nan, np.nan, np.nan, np.nan]
                 self.rms_err = rms
             self.condon_err = None
             self.fit_pos = self.coords
-            self.fit_shape = np.array([self.bmaj, self.bmin, self.pos_ang.value])
+            self.fit_shape = np.array([self.bmaj, self.bmin, self.pos_ang])
 
         self.psf_model = fmodel.func((X, Y), *self.fit).reshape(X.shape)

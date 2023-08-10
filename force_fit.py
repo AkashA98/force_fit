@@ -15,9 +15,37 @@ from matplotlib.backends.backend_pdf import PdfPages
 from footprints import vast_footprint, pickle_pointing_info, get_correct_file
 from fitter import fitter
 
+from matplotlib import rc
+
+rc("font", **{"family": "serif", "serif": ["Computer Modern Roman"]})
+rc("text", usetex=True)
+
 warnings.filterwarnings(
     action="ignore", category=astropy.wcs.FITSFixedWarning, module="astropy"
 )
+
+
+def parse_coordinates(ra, dec):
+    """Helper function to parse the input coordinates
+
+    Args:
+        ra (str/list): Right Ascension
+        dec (str/list): Declination
+
+    Returns:
+        astropy.coordinates.sky_coordinate.SkyCoord: coordinate object
+    """
+    if type(ra) is str:
+        ra = np.array([ra])
+        dec = np.array([dec])
+    try:
+        coord = SkyCoord(
+            ra=ra.astype(float) * u.degree, dec=dec.astype(float) * u.degree
+        )
+    except ValueError:
+        coord = SkyCoord(ra=ra, dec=dec, unit=(u.hourangle, u.degree))
+
+    return coord
 
 
 def validate_files(all_files):
@@ -78,8 +106,18 @@ class source:
         self.coords = coords
         # Create a table to store the results
         self.result = Table(
-            names=["date", "flux", "rms", "err", "snr", "sep"],
-            dtype=["U32", "f4", "f4", "f4", "f4", "f4"],
+            names=[
+                "epoch",
+                "date",
+                "freq",
+                "primary",
+                "flux",
+                "rms",
+                "err",
+                "snr",
+                "sep",
+            ],
+            dtype=["U8", "U32", "f4", "bool", "f4", "f4", "f4", "f4", "f4"],
         )
 
     def _add_files(
@@ -90,6 +128,8 @@ class source:
         stokes="I",
         size=2 * u.arcmin,
         epoch="xx",
+        primary=True,
+        search=True,
     ):
         """Takes the source coordinates as the input
         Args:
@@ -113,10 +153,22 @@ class source:
         self.image = img_path
         self.bkg = bkg_path
         self.rms = rms_path
+        self.is_primary = primary
+        self.search = search
 
         self.image_hdu = fits.open(self.image)
         self.image_hdr = self.image_hdu[0].header
         self.image_wcs = WCS(self.image_hdr)
+
+        # get the observation frequency
+        # try:
+        #     key = [i for i in self.image_hdr if self.image_hdr == "FREQ"][0]
+        #     key = key.replace("TYPE", "RVAL")
+        #     self.freq = self.image_hdr[key] / 1e6
+        # except IndexError:
+        #     self.freq = np.nan
+        #     logger.warning("Observation frequency not found")
+        self.freq = self.image_hdr["CRVAL3"] / 1e6
         # Check of the required coordinates are inside the given file
         if self.image_wcs.celestial.footprint_contains(self.coords):
             self.image_data = self.image_hdu[0].data
@@ -148,17 +200,20 @@ class source:
 
         # Check the diemsions and flatten it
         dim = self.image_data.ndim
-        bkg_dim = self.bkg_data.ndim
+
         if dim == 2:
             slc = (slice(None), slice(None))
         else:
             slc = [0] * (dim - 2)
             slc += [slice(None), slice(None)]
             slc = tuple(slc)
-        if dim != bkg_dim:
-            bkg_slc = (slice(None), slice(None))
-        else:
-            bkg_slc = slc
+
+        if (self.bkg_data is not None) or (self.rms_data is not None):
+            bkg_dim = self.bkg_data.ndim
+            if dim != bkg_dim:
+                bkg_slc = (slice(None), slice(None))
+            else:
+                bkg_slc = slc
         self.image_cut = Cutout2D(
             self.image_data[slc],
             [int(ind[0].item()), int(ind[1].item())],
@@ -228,12 +283,15 @@ class source:
         except NotImplementedError:
             raise NotImplementedError("The given file has no good data")
         self.fit = fit
-        self.fit.fit_gaussian()
+        self.fit.fit_gaussian(search=self.search)
 
         self.fit_offset = np.round(self.fit.fit_pos.separation(self.coords).arcsec, 2)
         self.result.add_row(
             [
+                self.epoch,
                 self.image_hdr["DATE"],
+                np.round(self.freq, 1),
+                self.is_primary,
                 self.fit.fit[0],
                 self.fit.rms_err,
                 self.fit.condon_err,
@@ -310,6 +368,79 @@ class source:
         )
 
 
+def get_vast_flux(coords, names, args):
+    """Helper function that runs the source findign specific to RACS/VAST
+
+    Args:
+        coords (astropy.coordinates.sky_coordinate.SkyCoord): Source coordinates
+        args (argparse.ArgumentParser): parser to handle cli arguments
+    """
+
+    # First get all the vast epochs and files
+    vast = vast_footprint(stokes=args.stokes)
+    vast._fetch_epochs()  # Get all the epochs and their paths
+    pickle_pointing_info(vast)  # Update the pickle files
+
+    # Now work on each source
+
+    for ind, s in enumerate(coords):
+        # Get all the files to search for
+        all_files = {}
+        for e in vast.epoch_names:
+            epoch_id = e[-2:]
+            files = get_correct_file(vast, epoch_id, s)
+            all_files[e] = files
+
+        all_files = validate_files(all_files=all_files)
+        epochs = list(all_files.keys())
+
+        # Now create a source class
+        src = source(coords=s)
+        if args.plot:
+            plotfile = PdfPages(f"{args.outdir}/{names[ind]}_stokes{args.stokes}.pdf")
+        else:
+            plotfile = None
+
+        for e in epochs:
+            epoch_files = all_files[e]
+            for i in range(len(epoch_files["images"])):
+                field_name = [
+                    i
+                    for i in epoch_files["images"][i].split("/")[-1].split(".")
+                    if (("RACS" in i) or ("VAST" in i))
+                ][0]
+                is_primary_field = (
+                    True if (field_name == epoch_files["primary_field"]) else False
+                )
+                try:
+                    src._add_files(
+                        epoch_files["images"][i],
+                        bkg_path=epoch_files["bkg"][i],
+                        rms_path=epoch_files["rms"][i],
+                        epoch=e[-2:],
+                        size=3 * u.arcmin,
+                        primary=is_primary_field,
+                        search=args.search,
+                    )
+                    src.get_cut_out_data()
+                    src.get_fluxes()
+                    src.save_cutout_image(plotfile=plotfile)
+                    src._clean()
+                except NotImplementedError:
+                    continue
+
+        if args.plot:
+            plotfile.close()
+        if args.flux:
+            src.result.write(
+                f"{args.outdir}/{names[ind]}_stokes{args.stokes}_measurements.txt",
+                format="ascii",
+                overwrite=True,
+            )
+        else:
+            print(src.result)
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="""Script to to targetted searches for VAST data.
@@ -318,25 +449,35 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "coords",
-        help="Source coordinates to search for",
-        nargs=2,
-        action="append",
-        type=list,
+        help="""Source coordinates to search for, can be a csv file having the columns
+         RA and DEC or a pair of strings with RA and DEC of the source (ascii format).
+          For eg. (both of the following work, but beware of the '-' in declination)
+         python force_fit.py 12:54:24.3 +34:12:05.3 (can be hmsdms or degrees) or 
+         python force_fit.py my_list_of_coords.csv""",
+        nargs="+",
+        type=str,
     )
     parser.add_argument(
         "--e",
         help="""Epochs to search for, by default searches in all the epochs.
         Should be provoided in str format, for eg. '00', or '23'. Default is 
         search for all epochs using 'all'.""",
-        type="str",
+        type=str,
         default="all",
     )
     parser.add_argument(
         "--stokes",
         help="""Stokes parameter to search for, by default searches for "I".
         Should be provoided in str format, for eg. "I", or "V" or "all".""",
-        type="str",
+        type=str,
         default="I",
+    )
+    parser.add_argument(
+        "--search",
+        help="""Flag that decides whether to search around in the coordinate space
+        or to just fit for flux with the position fixed""",
+        type=bool,
+        default=True,
     )
     parser.add_argument(
         "--outdir",
@@ -345,40 +486,42 @@ if __name__ == "__main__":
         type=str,
         default="./",
     )
+    parser.add_argument(
+        "--plot",
+        help="""Flag to control whether to save the plots""",
+        type=bool,
+        default=True,
+    )
+    parser.add_argument(
+        "--flux",
+        help="""Flag to control whether to save the measurements""",
+        type=bool,
+        default=True,
+    )
 
     args = parser.parse_args()
 
-    coord = SkyCoord(f"{args.coords[0]} {args.coords[1]}", unit=(u.hourangle, u.dgeree))
+    logger.remove()  # Remove all handlers added so far, including the default one.
+    logger.add("testlog.log", level="INFO")
 
-    # First get all the vast epochs and files
-    vast = vast_footprint(stokes=args.stokes)
-    vast._fetch_epochs()  # Get all the epochs and their paths
-    pickle_pointing_info(vast)  # Update the pickle files
+    coord = args.coords
+    try:
+        mask = os.path.isfile(args.coords[0])
+        # This means a file with RA and DEC are given
+        tab = Table.read(args.coords[0])
+        coord = parse_coordinates(tab["RA"].data, tab["DEC"].data)
+        try:
+            names = tab["Name"]
+            names = [i.replace(" ", "") for i in names]
+        except NameError:
+            names = coord.to_string("hmsdms")
+    except (FileNotFoundError, TypeError):
+        if len(coord) == 2:
+            # This means a pair of coords is given
+            coord = parse_coordinates(coord[0], coord[1])
+        else:
+            ra, dec = coord[0].split(" ")
+            coord = parse_coordinates(ra, dec)
+        names = coord.to_string("hmsdms")
 
-    # Get all the files to search for
-    all_files = {}
-    for e in vast.epoch_names:
-        epoch_id = e[-2:]
-        files = get_correct_file(vast, e, coord)
-        all_files[e] = files
-
-    all_files = validate_files(all_files=all_files)
-    epochs = list(all_files.keys())
-
-    # Now create a source class
-    src = source(coords=coord)
-    plotfile = PdfPages(f"{coord.to_string('hmsdms')}.pdf")
-
-    for e in epochs:
-        epoch_files = all_files[e]
-        for i in range(len(epoch_files["images"])):
-            src._add_files(
-                epoch_files["images"][i],
-                bkg_path=epoch_files["bkg"][i],
-                rms_path=epoch_files["rms"][i],
-                epoch=e[-2:],
-            )
-            src.get_cut_out_data()
-            src.get_fluxes()
-            src.save_cutout_image(plotfile=plotfile)
-            src._clean
+    get_vast_flux(coords=coord, names=names, args=args)
