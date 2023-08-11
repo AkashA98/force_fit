@@ -289,7 +289,7 @@ class source:
         self.result.add_row(
             [
                 self.epoch,
-                self.image_hdr["DATE"],
+                self.image_hdr["DATE-OBS"],
                 np.round(self.freq, 1),
                 self.is_primary,
                 self.fit.fit[0],

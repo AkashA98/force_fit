@@ -36,6 +36,7 @@ class fitter:
             data (ndarray): image data
             bkg (ndarray): mean map (background data)
             rms (ndarray): noise map (rms data)
+            wcs (astropy.wcs.wcs.WCS): WCS object of the image
             meta (astropy.io.fits.header.Header): header of the image
             coords (astropy.coordinates.sky_coordinate.SkyCoord): source coordinates
         """
