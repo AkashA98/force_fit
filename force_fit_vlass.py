@@ -10,6 +10,11 @@ from astropy.io import fits
 from astropy.wcs import WCS
 from fitter import fitter
 from matplotlib import pyplot as plt
+from astropy.nddata import NoOverlapError
+
+
+class Vlasserror(Exception):
+    pass
 
 
 class vlass:
@@ -164,23 +169,36 @@ class vlass:
                 slc += [slice(None), slice(None)]
                 slc = tuple(slc)
 
-            self.image_cut = Cutout2D(
-                image[0].data[slc],
-                [int(ind[0].item()), int(ind[1].item())],
-                wcs=wcs.celestial,
-                size=size,
-            )
+            # The way VLASS file is chose is by comapring the coordinates with the
+            # field center in the filename. Sometimes, this can cause artifacts which
+            # results in selecting files that do not have the source. In cases like these
+            # die gracefully.
+            try:
+                self.image_cut = Cutout2D(
+                    image[0].data[slc],
+                    [int(ind[0].item()), int(ind[1].item())],
+                    wcs=wcs.celestial,
+                    size=size,
+                )
 
-            self.rms_cut = Cutout2D(
-                rms[0].data[slc],
-                [int(ind[0].item()), int(ind[1].item())],
-                wcs=wcs.celestial,
-                size=size,
-            )
-            self.header = hdr
-            self.wcs = wcs
+                self.rms_cut = Cutout2D(
+                    rms[0].data[slc],
+                    [int(ind[0].item()), int(ind[1].item())],
+                    wcs=wcs.celestial,
+                    size=size,
+                )
+                self.header = hdr
+                self.wcs = wcs
+            except NoOverlapError:
+                logger.warning(
+                    f"Source is not present in the file {self.matched_files[e][0]} for epoch {e}"
+                )
+                self.image_cut = None
+                raise NoOverlapError
         else:
+            logger.warning(f"No matching file found for the epoch {e}")
             self.image_cut = None
+            raise FileNotFoundError
 
     def get_vlass_flux(self, e):
         """Get the forced fit for the given VLASS epoch
@@ -188,8 +206,8 @@ class vlass:
         Args:
             e (str): Observation epoch, one of (1.1, 1.2, 2.1, 2.2, 3.1)
         """
-        self.get_cutout_data(e=e)
-        if self.image_cut is not None:
+        try:
+            self.get_cutout_data(e=e)
             try:
                 fit = fitter(
                     self.image_cut.data,
@@ -199,30 +217,31 @@ class vlass:
                     self.header,
                     self.coord,
                 )
-            except NotImplementedError:
-                raise NotImplementedError("The given file has no good data")
-            self.fit = fit
-            self.fit.fit_gaussian(search=True)
+                self.fit = fit
+                self.fit.fit_gaussian(search=True)
 
-            self.fit_offset = np.round(
-                self.fit.fit_pos.separation(self.coord).arcsec, 2
-            )
-            self.result.add_row(
-                [
-                    e,
-                    self.header["DATE-OBS"],
-                    np.round(self.header["CRVAL3"] / 1e6, 1),
-                    True,
-                    self.fit.fit[0],
-                    self.fit.rms_err,
-                    self.fit.condon_err,
-                    np.abs(self.fit.fit[0] / self.fit.rms_err),
-                    self.fit_offset,
-                ]
-            )
-            self.save_cutout_image()
+                self.fit_offset = np.round(
+                    self.fit.fit_pos.separation(self.coord).arcsec, 2
+                )
+                self.result.add_row(
+                    [
+                        e,
+                        self.header["DATE-OBS"],
+                        np.round(self.header["CRVAL3"] / 1e6, 1),
+                        True,
+                        self.fit.fit[0],
+                        self.fit.rms_err,
+                        self.fit.condon_err,
+                        np.abs(self.fit.fit[0] / self.fit.rms_err),
+                        self.fit_offset,
+                    ]
+                )
+            except (ValueError, NoOverlapError):
+                raise Vlasserror
+        except (NoOverlapError, FileNotFoundError):
+            raise Vlasserror
 
-    def save_cutout_image(self, plotfile=None):
+    def save_cutout_image(self, e, plotfile=None):
         """Helper function to save the source finding image"""
         plt.clf()
         fig = plt.figure(figsize=(8, 6))
@@ -238,7 +257,7 @@ class vlass:
         else:
             levels = levels * self.fit.fit[0]
         ax.contour(X, Y, Z, levels=levels, colors="r")
-        src_pos = self.image_cut.wcs.celestial.world_to_pixel(self.coords)
+        src_pos = self.image_cut.wcs.celestial.world_to_pixel(self.coord)
         ax.plot(
             [src_pos[0], src_pos[0]],
             [src_pos[1] + 1, src_pos[1] + 2],
@@ -262,7 +281,7 @@ class vlass:
         ax.tick_params(labelsize=15)
         ax.grid(True, color="k", ls="--")
 
-        title = f"Stokes{self.stokes} image, epoch {self.epoch}, with {self.fit_offset} arcsec offset"
+        title = f"VLASS StokesI image, epoch {e}, with {self.fit_offset} arcsec offset"
         ax.set_title(title, fontsize=20)
         ax.set_xlabel("RA", fontsize=20)
         ax.set_ylabel("DEC", fontsize=20)
@@ -286,14 +305,3 @@ class vlass:
             )
         except AttributeError:
             pass
-
-
-if __name__ == "__main__":
-    s = SkyCoord("20:39:09.12 -30:45:20.84", unit=(u.hourangle, u.degree))
-
-    v = vlass(s)
-    v.get_vlass_file()
-    v.download_files()
-    for e in v.epochs:
-        v.get_vlass_flux(e=e)
-        v.clean()

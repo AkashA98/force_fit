@@ -2,6 +2,7 @@ import numpy as np
 from loguru import logger
 from astropy import units as u
 from lmfit import Model, create_params
+from astropy.nddata import NoOverlapError
 
 fwhm_to_sig = np.sqrt(8 * np.log(2))
 nan_mask_value = 1e8
@@ -61,7 +62,11 @@ class fitter:
 
         if np.all(np.isnan(data)):
             logger.error("All input data are NaN's, so doing nothing.")
-            raise NotImplementedError("The given file has no good data")
+            raise ValueError("The given file has no good data")
+
+        if np.any(self.center < 0):
+            logger.error("The given source cooridnates are outside the image")
+            raise NoOverlapError("Source is not in the image")
 
         # Correct the data for nan's
         # Handle nan values. This is a bad way of handling nan values

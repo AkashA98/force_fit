@@ -7,7 +7,8 @@ from loguru import logger
 from astropy.io import fits
 from astropy.wcs import WCS
 from astropy import units as u
-from astropy.table import Table
+from astropy.table import Table, vstack
+from astropy.nddata import NoOverlapError
 from astropy.nddata import Cutout2D
 from matplotlib import pyplot as plt
 from astropy.coordinates import SkyCoord
@@ -189,7 +190,7 @@ class source:
                 self.rms_data = fits.getdata(self.rms, 0)
         else:
             logger.error("The given file does not contain the source coordinates")
-            raise NotImplementedError(
+            raise NoOverlapError(
                 "The given file does not contain the source coordinates"
             )
 
@@ -280,25 +281,27 @@ class source:
                     self.image_hdr,
                     self.coords,
                 )
-        except NotImplementedError:
-            raise NotImplementedError("The given file has no good data")
-        self.fit = fit
-        self.fit.fit_gaussian(search=self.search)
+            self.fit = fit
+            self.fit.fit_gaussian(search=self.search)
 
-        self.fit_offset = np.round(self.fit.fit_pos.separation(self.coords).arcsec, 2)
-        self.result.add_row(
-            [
-                self.epoch,
-                self.image_hdr["DATE-OBS"],
-                np.round(self.freq, 1),
-                self.is_primary,
-                self.fit.fit[0],
-                self.fit.rms_err,
-                self.fit.condon_err,
-                np.abs(self.fit.fit[0] / self.fit.rms_err),
-                self.fit_offset,
-            ]
-        )
+            self.fit_offset = np.round(
+                self.fit.fit_pos.separation(self.coords).arcsec, 2
+            )
+            self.result.add_row(
+                [
+                    self.epoch,
+                    self.image_hdr["DATE-OBS"],
+                    np.round(self.freq, 1),
+                    self.is_primary,
+                    self.fit.fit[0],
+                    self.fit.rms_err,
+                    self.fit.condon_err,
+                    np.abs(self.fit.fit[0] / self.fit.rms_err),
+                    self.fit_offset,
+                ]
+            )
+        except (ValueError, NoOverlapError):
+            pass
 
     def save_cutout_image(self, plotfile=None):
         """
@@ -368,8 +371,8 @@ class source:
         )
 
 
-def get_vast_flux(coords, names, args):
-    """Helper function that runs the source findign specific to RACS/VAST
+def get_vast_vlass_flux(coords, names, args):
+    """Helper function that runs the source finding for combined RACS/VAST and VLASS data
 
     Args:
         coords (astropy.coordinates.sky_coordinate.SkyCoord): Source coordinates
@@ -418,7 +421,7 @@ def get_vast_flux(coords, names, args):
                         bkg_path=epoch_files["bkg"][i],
                         rms_path=epoch_files["rms"][i],
                         epoch=e[-2:],
-                        size=3 * u.arcmin,
+                        size=args.size * u.arcmin,
                         primary=is_primary_field,
                         search=args.search,
                     )
@@ -426,8 +429,26 @@ def get_vast_flux(coords, names, args):
                     src.get_fluxes()
                     src.save_cutout_image(plotfile=plotfile)
                     src._clean()
-                except NotImplementedError:
+                except (ValueError, NoOverlapError):
                     continue
+
+        if args.vlass:
+            from force_fit_vlass import vlass, Vlasserror
+
+            # Do the same for VLASS
+            v = vlass(s)
+            v.get_vlass_file()
+            v.download_files()
+            for e in v.epochs:
+                try:
+                    v.get_vlass_flux(e=e)
+                    if v.image_cut is not None:
+                        v.save_cutout_image(e, plotfile=plotfile)
+                    v.clean()
+                except Vlasserror:
+                    logger.warning("Failed to do force fitting on VLASS data")
+                    continue
+            src.result = vstack([src.result, v.result], join_type="exact")
 
         if args.plot:
             plotfile.close()
@@ -498,6 +519,18 @@ if __name__ == "__main__":
         type=bool,
         default=True,
     )
+    parser.add_argument(
+        "--vlass",
+        help="""Flag to control whether to do force fit for VLASS data""",
+        type=bool,
+        default=False,
+    )
+    parser.add_argument(
+        "--size",
+        help="""Image cut out size in arcmin""",
+        type=float,
+        default=2,
+    )
 
     args = parser.parse_args()
 
@@ -524,4 +557,4 @@ if __name__ == "__main__":
             coord = parse_coordinates(ra, dec)
         names = coord.to_string("hmsdms")
 
-    get_vast_flux(coords=coord, names=names, args=args)
+    get_vast_vlass_flux(coords=coord, names=names, args=args)
