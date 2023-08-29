@@ -3,7 +3,7 @@ A force fitting software for radio images, currently focussed on
 ASKAP and VLASS images. 
 
 ## Intention behind this code
-Source fitting packages like Selavy/Aegean/Pydbsf are routinely 
+Source fitting packages like Selavy/Aegean/Pybdsf are routinely 
 used for finding radio sources in survey images. Given a noise
 threshold (usually 5-sigma), these routines will produce source
 catalogs. But if we want to look at faint sources (say 3-sigma)
@@ -22,7 +22,7 @@ a few hundreds), this code can look around the given positions
 to find sources. It will look for point sources in the images.
 
 ## Limitations
-This code is not intended to be used as a scaled Selvay/Pydbsf. It 
+This code is not intended to be used as a scaled Selvay/Pybdsf. It 
 is not extremely optimized between speed and source searching.
 It can robustly fit for sources but is not scalable to all the
 survey images. And it can Currently it can fit only for point 
