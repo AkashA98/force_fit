@@ -6,6 +6,7 @@ import numpy as np
 from loguru import logger
 from astropy.io import fits
 from astropy.wcs import WCS
+from astropy.time import Time
 from astropy import units as u
 from astropy.table import Table, vstack
 from astropy.nddata import NoOverlapError
@@ -371,6 +372,150 @@ class source:
         )
 
 
+def plot_lc(t, disc_date=None, det_sigma=5, stokes="I", name=None, fig=None, ax=None):
+    """Helper function to plot the light curve of the source
+
+    Args:
+        t (astropy.table.Table): The results table of the source object
+        disc_date (str, optional): The discovery date of the source.
+            Defaults to None.
+        det_sigma (int, optional): The noise threshold for detection. Defaults to 5.
+        fig (matplotlib.figure.Figure, optional): Figure object. Defaults to None.
+        ax (matplotlib.axes._subplots.AxesSubplot, optional): Axes of subplot.
+            Defaults to None.
+
+    Returns:
+        matplotlib.figure.Figure, matplotlib.axes._subplots.AxesSubplot:
+            Plotted fig, ax
+    """
+    # Get vlass data
+
+    if (fig is None) | (ax is None):
+        fig, ax = plt.subplots(figsize=(8, 6))
+    else:
+        fig = fig
+        ax = ax
+    vlass_mask = np.in1d(t["epoch"], ["1.1v2", "1.2v2", "2.1", "2.2", "3.1"])
+    if np.any(vlass_mask):
+        upp_lim_mask = t[vlass_mask]["snr"] < det_sigma
+        f = t[vlass_mask]["flux"]
+        e = np.nanmax([t[vlass_mask]["rms"], t[vlass_mask]["err"]], axis=0)
+        f[upp_lim_mask] = det_sigma * e[upp_lim_mask]
+        if disc_date is None:
+            dtvlass = Time(t[vlass_mask]["date"]).mjd
+        else:
+            dtvlass = (Time(t[vlass_mask]["date"]) - disc_date).jd
+        ax.errorbar(
+            dtvlass,
+            f,
+            yerr=e,
+            uplims=upp_lim_mask.astype(int),
+            barsabove=True,
+            capsize=4,
+            fmt="D",
+            markersize=10,
+            color="k",
+            label="VLASS (2-4 GHz)",
+        )
+
+    # Now get to RACS
+    racs_mask = np.in1d(t["freq"], [887.5, 1367.5, 1655.5])
+    if np.any(racs_mask):
+        if disc_date is None:
+            dtracs = Time(t[racs_mask]["date"]).mjd
+        else:
+            dtracs = (Time(t[racs_mask]["date"]) - disc_date).jd
+        if stokes == "I":
+            upp_lim_mask = (t[racs_mask]["snr"] < det_sigma) | (
+                t[racs_mask]["flux"] < 0
+            )
+        else:
+            upp_lim_mask = t[racs_mask]["snr"] < det_sigma
+        f = t[racs_mask]["flux"]
+        e = np.nanmax([t[racs_mask]["rms"], t[racs_mask]["err"]], axis=0)
+
+        f[upp_lim_mask] = det_sigma * e[upp_lim_mask]
+
+        # Do it differently for different frequencies and RACS/VAST
+        # RACS/VAST mask
+        racs_vast_mask = t[racs_mask]["freq"].data == 887.5
+        racs_mid_mask = t[racs_mask]["freq"].data == 1367.5
+        racs_high_mask = t[racs_mask]["freq"].data == 1655.5
+        vast_mask = np.in1d(t[racs_mask][racs_vast_mask]["epoch"], [0, 29], invert=True)
+
+        if np.any(~vast_mask):
+            ax.errorbar(
+                dtracs[racs_vast_mask][~vast_mask],
+                f[racs_vast_mask][~vast_mask],
+                yerr=e[racs_vast_mask][~vast_mask],
+                uplims=upp_lim_mask.astype(int)[racs_vast_mask][~vast_mask],
+                barsabove=True,
+                capsize=4,
+                fmt="*",
+                markersize=10,
+                color="orange",
+                label="RACS (843 MHz)",
+            )
+        if np.any(vast_mask):
+            ax.errorbar(
+                dtracs[racs_vast_mask][vast_mask],
+                f[racs_vast_mask][vast_mask],
+                yerr=e[racs_vast_mask][vast_mask],
+                uplims=upp_lim_mask.astype(int)[racs_vast_mask][vast_mask],
+                barsabove=True,
+                capsize=4,
+                fmt="*",
+                markersize=10,
+                color="r",
+                label="VAST (843 MHz)",
+            )
+
+        if np.any(racs_mid_mask):
+            ax.errorbar(
+                dtracs[racs_mid_mask],
+                f[racs_mid_mask],
+                yerr=e[racs_mid_mask],
+                uplims=upp_lim_mask.astype(int)[racs_mid_mask],
+                barsabove=True,
+                capsize=4,
+                fmt="s",
+                fillstyle="none",
+                markersize=10,
+                color="r",
+                label="RACS (1367.5 MHz)",
+            )
+
+        if np.any(racs_high_mask):
+            ax.errorbar(
+                dtracs[racs_high_mask],
+                f[racs_high_mask],
+                yerr=e[racs_high_mask],
+                uplims=upp_lim_mask.astype(int)[racs_high_mask],
+                barsabove=True,
+                capsize=4,
+                fmt="s",
+                markersize=10,
+                color="r",
+                label="RACS (1655.5 MHz)",
+            )
+
+    ax.legend(fontsize=15)
+    ax.tick_params(labelsize=15)
+    ax.set_xlabel("UTC", fontsize=20)
+    ax.set_ylabel("Flux density (mJy)", fontsize=20)
+
+    # Change the dates from MJD to UTC
+    mjds = ax.get_xlim()
+    mjds = np.linspace(mjds[0], mjds[-1], 5)
+    utcs = Time(mjds, format="mjd")
+    ax.set_xticks(mjds)
+    ax.set_xticklabels(utcs.to_value("isot", subfmt="date"))
+    if not name is None:
+        ax.set_title(f"Light curve for the source {name}", fontsize=20)
+    plt.tight_layout()
+    return fig, ax
+
+
 def get_vast_vlass_flux(coords, names, args):
     """Helper function that runs the source finding for combined RACS/VAST and VLASS data
 
@@ -460,6 +605,7 @@ def get_vast_vlass_flux(coords, names, args):
             )
         else:
             print(src.result)
+        del src
 
 
 if __name__ == "__main__":
