@@ -1,4 +1,4 @@
-#force fit
+# force fit
 A force fitting software for radio images, currently focussed on 
 ASKAP and VLASS images. 
 
@@ -27,7 +27,4 @@ is not extremely optimized between speed and source searching.
 It can robustly fit for sources but is not scalable to all the
 survey images. And it can Currently it can fit only for point 
 sources.
-
-# Usage
-It can be used as follows:
 
