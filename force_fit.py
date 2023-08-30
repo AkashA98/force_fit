@@ -308,54 +308,57 @@ class source:
         """
         Helper function to save the source finding image
         """
-        plt.clf()
-        fig = plt.figure(figsize=(8, 6))
-        ax = fig.add_subplot(projection=self.image_cut.wcs)
-        ax.imshow(self.image_cut.data, aspect="auto", origin="lower", cmap="gray_r")
-        X, Y = self.fit.grid
-        Z = self.fit.psf_model
-        levels = np.array(
-            [0.049787068367863944, 0.1353352832366127, 0.36787944117144233]
-        )
-        if self.fit.fit[0] < 0:
-            levels = self.fit.fit[0] * np.flip(levels)
-        else:
-            levels = levels * self.fit.fit[0]
-        ax.contour(X, Y, Z, levels=levels, colors="r")
-        src_pos = self.image_cut.wcs.celestial.world_to_pixel(self.coords)
-        ax.plot(
-            [src_pos[0], src_pos[0]],
-            [src_pos[1] + 1, src_pos[1] + 2],
-            color="r",
-        )
-        ax.plot(
-            [src_pos[0], src_pos[0]],
-            [src_pos[1] - 2, src_pos[1] - 1],
-            color="r",
-        )
-        ax.plot(
-            [src_pos[0] - 2, src_pos[0] - 1],
-            [src_pos[1], src_pos[1]],
-            color="r",
-        )
-        ax.plot(
-            [src_pos[0] + 1, src_pos[0] + 2],
-            [src_pos[1], src_pos[1]],
-            color="r",
-        )
-        ax.tick_params(labelsize=15)
-        ax.grid(True, color="k", ls="--")
+        try:
+            plt.clf()
+            fig = plt.figure(figsize=(8, 6))
+            ax = fig.add_subplot(projection=self.image_cut.wcs)
+            ax.imshow(self.image_cut.data, aspect="auto", origin="lower", cmap="gray_r")
+            X, Y = self.fit.grid
+            Z = self.fit.psf_model
+            levels = np.array(
+                [0.049787068367863944, 0.1353352832366127, 0.36787944117144233]
+            )
+            if self.fit.fit[0] < 0:
+                levels = self.fit.fit[0] * np.flip(levels)
+            else:
+                levels = levels * self.fit.fit[0]
+            ax.contour(X, Y, Z, levels=levels, colors="r")
+            src_pos = self.image_cut.wcs.celestial.world_to_pixel(self.coords)
+            ax.plot(
+                [src_pos[0], src_pos[0]],
+                [src_pos[1] + 1, src_pos[1] + 2],
+                color="r",
+            )
+            ax.plot(
+                [src_pos[0], src_pos[0]],
+                [src_pos[1] - 2, src_pos[1] - 1],
+                color="r",
+            )
+            ax.plot(
+                [src_pos[0] - 2, src_pos[0] - 1],
+                [src_pos[1], src_pos[1]],
+                color="r",
+            )
+            ax.plot(
+                [src_pos[0] + 1, src_pos[0] + 2],
+                [src_pos[1], src_pos[1]],
+                color="r",
+            )
+            ax.tick_params(labelsize=15)
+            ax.grid(True, color="k", ls="--")
 
-        title = f"Stokes{self.stokes} image, epoch {self.epoch}, with {self.fit_offset} arcsec offset"
-        ax.set_title(title, fontsize=20)
-        ax.set_xlabel("RA", fontsize=20)
-        ax.set_ylabel("DEC", fontsize=20)
-        if plotfile is None:
-            plt.show()
-        else:
-            plotfile.savefig(bbox_inches="tight")
-            plt.close("all")
-            return plotfile
+            title = f"Stokes{self.stokes} image, epoch {self.epoch}, with {self.fit_offset} arcsec offset"
+            ax.set_title(title, fontsize=20)
+            ax.set_xlabel("RA", fontsize=20)
+            ax.set_ylabel("DEC", fontsize=20)
+            if plotfile is None:
+                plt.show()
+            else:
+                plotfile.savefig(bbox_inches="tight")
+                plt.close("all")
+                return plotfile
+        except AttributeError:
+            raise AttributeError
 
     def _clean(self):
         """Close all the opened files and remove the ouput"""
@@ -372,7 +375,16 @@ class source:
         )
 
 
-def plot_lc(t, disc_date=None, det_sigma=5, stokes="I", name=None, fig=None, ax=None):
+def plot_lc(
+    t,
+    args,
+    disc_date=None,
+    det_sigma=5,
+    name="test",
+    fig=None,
+    ax=None,
+    return_plot=False,
+):
     """Helper function to plot the light curve of the source
 
     Args:
@@ -425,7 +437,7 @@ def plot_lc(t, disc_date=None, det_sigma=5, stokes="I", name=None, fig=None, ax=
             dtracs = Time(t[racs_mask]["date"]).mjd
         else:
             dtracs = (Time(t[racs_mask]["date"]) - disc_date).jd
-        if stokes == "I":
+        if args.stokes == "I":
             upp_lim_mask = (t[racs_mask]["snr"] < det_sigma) | (
                 t[racs_mask]["flux"] < 0
             )
@@ -513,7 +525,10 @@ def plot_lc(t, disc_date=None, det_sigma=5, stokes="I", name=None, fig=None, ax=
     if not name is None:
         ax.set_title(f"Light curve for the source {name}", fontsize=20)
     plt.tight_layout()
-    return fig, ax
+    if return_plot:
+        return fig, ax
+    else:
+        plt.savefig(f"{args.outdir}/{name}_stokes{args.stokes}_lc.pdf")
 
 
 def get_vast_vlass_flux(coords, names, args):
@@ -574,7 +589,7 @@ def get_vast_vlass_flux(coords, names, args):
                     src.get_fluxes()
                     src.save_cutout_image(plotfile=plotfile)
                     src._clean()
-                except (ValueError, NoOverlapError):
+                except (ValueError, NoOverlapError, AttributeError):
                     continue
 
         if args.vlass:
@@ -594,9 +609,11 @@ def get_vast_vlass_flux(coords, names, args):
                     logger.warning("Failed to do force fitting on VLASS data")
                     continue
             src.result = vstack([src.result, v.result], join_type="exact")
+            del v
 
         if args.plot:
             plotfile.close()
+            plot_lc(src.result, args=args, det_sigma=3, name=s.to_string("hmsdms"))
         if args.flux:
             src.result.write(
                 f"{args.outdir}/{names[ind]}_stokes{args.stokes}_measurements.txt",
