@@ -21,14 +21,17 @@ class vlass:
     vlass_base_url = "https://archive-new.nrao.edu/vlass/quicklook/"
     base_dir = "../vlass_files/"
 
-    def __init__(self, coord):
+    def __init__(self, coord, search=True):
         """Initalize a vlass class taking the source coordinates
 
         Args:
             coord (astropy.coordinates.sky_coordinate.SkyCoord): Source coordinates
+            search (bool, Optional): Fit for position or force fit? Defaults to True,
+                which is to fit for position.
         """
         self.coord = coord
         self.all_epochs = ["1.1", "1.2", "2.1", "2.2", "3.1"]
+        self.search = search
 
         epoch_tile_info = {}
         for e in self.all_epochs:
@@ -200,14 +203,14 @@ class vlass:
             self.image_cut = None
             raise FileNotFoundError
 
-    def get_vlass_flux(self, e):
+    def get_vlass_flux(self, e, size=30*u.arcsec):
         """Get the forced fit for the given VLASS epoch
 
         Args:
             e (str): Observation epoch, one of (1.1, 1.2, 2.1, 2.2, 3.1)
         """
         try:
-            self.get_cutout_data(e=e)
+            self.get_cutout_data(e=e, size=size)
             try:
                 fit = fitter(
                     self.image_cut.data,
@@ -216,9 +219,10 @@ class vlass:
                     self.image_cut.wcs,
                     self.header,
                     self.coord,
+                    search=self.search,
                 )
                 self.fit = fit
-                self.fit.fit_gaussian(search=True)
+                self.fit.fit_gaussian()
 
                 self.fit_offset = np.round(
                     self.fit.fit_pos.separation(self.coord).arcsec, 2

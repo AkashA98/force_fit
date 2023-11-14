@@ -245,6 +245,7 @@ class source:
     def get_fluxes(self):
         """Function that does the fitting and flux estimation"""
         logger.info("Starting the source fitting")
+        search = self.search
         try:
             if (self.bkg_cut is None) and (self.rms_cut is None):
                 fit = fitter(
@@ -254,6 +255,7 @@ class source:
                     self.image_cut.wcs,
                     self.image_hdr,
                     self.coords,
+                    search=search,
                 )
             elif (self.bkg_cut is not None) and (self.rms_cut is None):
                 fit = fitter(
@@ -263,6 +265,7 @@ class source:
                     self.image_cut.wcs,
                     self.image_hdr,
                     self.coords,
+                    search=search,
                 )
             elif (self.bkg_cut is None) and (self.rms_cut is not None):
                 fit = fitter(
@@ -272,6 +275,7 @@ class source:
                     self.image_cut.wcs,
                     self.image_hdr,
                     self.coords,
+                    search=search,
                 )
             else:
                 fit = fitter(
@@ -281,9 +285,10 @@ class source:
                     self.image_cut.wcs,
                     self.image_hdr,
                     self.coords,
+                    search=search,
                 )
             self.fit = fit
-            self.fit.fit_gaussian(search=self.search)
+            self.fit.fit_gaussian()
 
             self.fit_offset = np.round(
                 self.fit.fit_pos.separation(self.coords).arcsec, 2
@@ -453,7 +458,7 @@ def plot_lc(
         racs_vast_mask = t[racs_mask]["freq"].data == 887.5
         racs_mid_mask = t[racs_mask]["freq"].data == 1367.5
         racs_high_mask = t[racs_mask]["freq"].data == 1655.5
-        vast_mask = np.in1d(t[racs_mask][racs_vast_mask]["epoch"], [0, 29], invert=True)
+        vast_mask = np.in1d(t[racs_mask][racs_vast_mask]["epoch"], ["00", "29"], invert=True)
 
         if np.any(~vast_mask):
             ax.errorbar(
@@ -596,7 +601,7 @@ def get_vast_vlass_flux(coords, names, args):
             from force_fit_vlass import vlass, Vlasserror
 
             # Do the same for VLASS
-            v = vlass(s)
+            v = vlass(s, search=args.search)
             v.get_vlass_file()
             v.download_files()
             for e in v.epochs:
@@ -613,7 +618,7 @@ def get_vast_vlass_flux(coords, names, args):
 
         if args.plot:
             plotfile.close()
-            plot_lc(src.result, args=args, det_sigma=3, name=s.to_string("hmsdms"))
+            plot_lc(src.result, args=args, det_sigma=3, name=names[ind])
         if args.flux:
             src.result.write(
                 f"{args.outdir}/{names[ind]}_stokes{args.stokes}_measurements.txt",
@@ -660,8 +665,14 @@ if __name__ == "__main__":
         "--search",
         help="""Flag that decides whether to search around in the coordinate space
         or to just fit for flux with the position fixed""",
-        type=bool,
-        default=True,
+        action='store_true',
+    )
+    parser.add_argument(
+        "--no-search",
+        help="""Flag that decides whether to search around in the coordinate space
+        or to just fit for flux with the position fixed""",
+        dest="search",
+        action="store_false",
     )
     parser.add_argument(
         "--outdir",
@@ -685,8 +696,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--vlass",
         help="""Flag to control whether to do force fit for VLASS data""",
-        type=bool,
-        default=False,
+        action="store_true",
     )
     parser.add_argument(
         "--size",
@@ -698,13 +708,13 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     logger.remove()  # Remove all handlers added so far, including the default one.
-    logger.add("testlog.log", level="INFO")
+    logger.add("testlog.log", level="WARNINGS")
 
     coord = args.coords
     try:
         mask = os.path.isfile(args.coords[0])
         # This means a file with RA and DEC are given
-        tab = Table.read(args.coords[0])
+        tab = Table.read(args.coords[0], format='ascii')
         coord = parse_coordinates(tab["RA"].data, tab["DEC"].data)
         try:
             names = tab["Name"]

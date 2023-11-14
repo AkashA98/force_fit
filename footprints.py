@@ -94,16 +94,26 @@ class vast_footprint:
         proper_names = ["EPOCH" + i.rjust(2, "0") for i in names]
 
         # Check for valid epochs
-        mask = []
-        for n in names:
+        name_mask = []
+        file_mask = []
+        for i, n in enumerate(names):
             try:
                 _ = int(n)
-                mask.append(1)
+                name_mask.append(1)
             except ValueError:
-                mask.append(0)
-        mask = np.array(mask, dtype=bool)
-        self.epoch_mask = mask
-        self.epoch_names = np.array(proper_names)[mask]
+                name_mask.append(0)
+            
+            # Check if images exist
+            images = glob.glob(f"{self.vast_root}/{self.raw_epoch_names[i]}/*")
+            if len(images)>0:
+                file_mask.append(1)
+            else:
+                file_mask.append(0)
+                
+        name_mask = np.array(name_mask, dtype=bool)
+        file_mask = np.array(file_mask, dtype=bool)
+        self.epoch_mask = (name_mask & file_mask)
+        self.epoch_names = np.array(proper_names)[self.epoch_mask]
         return None
 
     def _check_for_racs_epochs(self):
@@ -137,31 +147,33 @@ def get_vast_pointings(basepath):
     # Now get info for the required epochs
     paths = glob.glob(f"{basepath}/*.fits")
     paths.sort()
+    if paths==[]:
+        raise FileNotFoundError
+    else:    
+        # Put all the WCS objects
+        all_paths = []
+        all_wcs = []
+        all_centers = []
 
-    # Put all the WCS objects
-    all_paths = []
-    all_wcs = []
-    all_centers = []
+        for p in paths:
+            hdu = fits.open(p)
+            wcs = WCS(hdu[0].header)
+            if wcs.naxis == 4:
+                wcs_cel = wcs.celestial
+            center = wcs_cel.pixel_to_world(
+                wcs.pixel_shape[0] // 2, wcs.pixel_shape[1] // 2
+            )
+            all_paths.append(p)
+            all_wcs.append(wcs)
+            all_centers.append([center.ra.degree, center.dec.degree])
+            hdu.close()
 
-    for p in paths:
-        hdu = fits.open(p)
-        wcs = WCS(hdu[0].header)
-        if wcs.naxis == 4:
-            wcs_cel = wcs.celestial
-        center = wcs_cel.pixel_to_world(
-            wcs.pixel_shape[0] // 2, wcs.pixel_shape[1] // 2
+        all_centers = np.array(all_centers)
+        all_centers = SkyCoord(
+            ra=all_centers[:, 0] * u.degree, dec=all_centers[:, 1] * u.degree
         )
-        all_paths.append(p)
-        all_wcs.append(wcs)
-        all_centers.append([center.ra.degree, center.dec.degree])
-        hdu.close()
 
-    all_centers = np.array(all_centers)
-    all_centers = SkyCoord(
-        ra=all_centers[:, 0] * u.degree, dec=all_centers[:, 1] * u.degree
-    )
-
-    return all_centers, np.array(all_wcs), np.array(paths)
+        return all_centers, np.array(all_wcs), np.array(paths)
 
 
 def pickle_pointing_info(vast):
@@ -194,15 +206,20 @@ def pickle_pointing_info(vast):
 
     # For epochs that are missing, write put the pickle files
     for e in epoch_names[~mask]:
-        centers, wcs, paths = get_vast_pointings(vast.epochs[e]["images"])
-        epoch_pointings = {"centers": centers, "wcs": wcs, "paths": paths}
+        try:
+            centers, wcs, paths = get_vast_pointings(vast.epochs[e]["images"])
+            epoch_pointings = {"centers": centers, "wcs": wcs, "paths": paths}
 
-        with open(f"pickles_{vast.stokes}/{e}.pkl", "wb") as f:
-            pickle.dump(epoch_pointings, f)
+            with open(f"pickles_{vast.stokes}/{e}.pkl", "wb") as f:
+                pickle.dump(epoch_pointings, f)
+                logger.info(
+                    f"Making pickle files for the epoch {e}: pickles_{vast.stokes}/{e}.pkl"
+                )
+                f.close()
+        except FileNotFoundError:
             logger.info(
-                f"Making pickle files for the epoch {e}: pickles_{vast.stokes}/{e}.pkl"
+                f"Making pickle files for the epoch {e} failed, no images found"
             )
-            f.close()
 
     return None
 

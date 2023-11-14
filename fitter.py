@@ -29,7 +29,7 @@ def gaussian_kernel(X, A, x0, y0, sx, sy, pa):
 class fitter:
     """A fitter class that does the 2D gaussian fitting"""
 
-    def __init__(self, data, bkg, rms, wcs, meta, coords) -> None:
+    def __init__(self, data, bkg, rms, wcs, meta, coords, search=True) -> None:
         """Intialize a fitter class. Takes the image, bkg, rms data
         as inputs along with the header that has the metadata
 
@@ -40,6 +40,8 @@ class fitter:
             wcs (astropy.wcs.wcs.WCS): WCS object of the image
             meta (astropy.io.fits.header.Header): header of the image
             coords (astropy.coordinates.sky_coordinate.SkyCoord): source coordinates
+            search (bool, Optional): Do a force fit or fit for position? Defaults to 
+                True, to search for position.
         """
 
         self.image = data
@@ -49,6 +51,7 @@ class fitter:
         self.rms_flag = False if rms is None else True
         self.hdr = meta
         self.wcs = wcs
+        self.search = search
         self.coords = coords
         center = self.wcs.world_to_pixel(self.coords)
         self.center = np.round(np.array(center), 0).astype(int)
@@ -85,7 +88,7 @@ class fitter:
 
         if not self.rms_flag:
             logger.warning("No RMS data provided, assuming equal weights -- 1 mJy")
-            self.rms = np.ones_like(data) * 0.001
+            self.rms = np.ones_like(data)
         else:
             # Set nan values in rms map so high, that weight is 0
             self.rms[np.isnan(self.rms)] = nan_mask_value
@@ -165,8 +168,8 @@ class fitter:
     def make_params(self, data, center):
         """Helper function to make the fot parameters"""
         data_max = np.max(np.abs(data))
-        peak_value = np.mean(
-            data[center[0] - 1 : center[0] + 2, center[1] - 1 : center[1] + 1]
+        peak_value = np.max(
+            data[center[0] - 1 : center[0] + 2, center[1] - 1 : center[1] + 2]
         )
 
         sx = self.bmaj_pix / fwhm_to_sig
@@ -206,18 +209,18 @@ class fitter:
     def revise_params(self, fit, errs=None):
         """Helper function to revise the fit."""
         p0 = fit
-        if errs is None:
-            sx = self.bmaj_pix / fwhm_to_sig
-            sy = self.bmin_pix / fwhm_to_sig
-            pa = self.pos_ang
-            errs = np.array([0.25, sx, sy, np.sqrt(sx), np.sqrt(sy), pa])
+        #if errs is None:
+        sx = self.bmaj_pix / fwhm_to_sig
+        sy = self.bmin_pix / fwhm_to_sig
+        pa = self.pos_ang
+        errs = np.array([0.5, sx, sy, np.sqrt(sx), np.sqrt(sy), pa])
 
         params = create_params(
-            A=dict(value=p0[0], min=p0[0] - 2 * errs[0], max=p0[0] + 2 * errs[0]),
+            A=dict(value=p0[0], min=p0[0]/2, max=p0[0]*2),
             x0=dict(value=p0[1], min=p0[1] - 2 * errs[1], max=p0[1] + 2 * errs[1]),
             y0=dict(value=p0[2], min=p0[2] - 2 * errs[2], max=p0[2] + 2 * errs[2]),
-            sx=dict(value=p0[3], min=p0[3] - 2 * errs[3], max=p0[3] + 2 * errs[3]),
-            sy=dict(value=p0[4], min=p0[4] - 2 * errs[4], max=p0[4] + 2 * errs[4]),
+            sx=dict(value=sx, min=0.5*sx, max=1.5*sx),
+            sy=dict(value=sy, min=0.5*sy, max=1.5*sy),
             pa=dict(value=p0[5], min=p0[5] - 2 * errs[5], max=p0[5] + 2 * errs[5]),
         )
         return params
@@ -252,7 +255,7 @@ class fitter:
 
         return flux, flux_err
 
-    def fit_gaussian(self, search=True):
+    def fit_gaussian(self):
         """
         Do the 2D gaussian fitting using the lmfit package
         """
@@ -261,6 +264,7 @@ class fitter:
         bkg_data = np.copy(self.bkg)
         rms_data = np.copy(self.rms)
         sub_data = data - bkg_data
+        search = self.search
 
         self._get_psf_info()
 
@@ -272,13 +276,13 @@ class fitter:
         center = self.center
         # Make an initial guess and the bounds for the parameters
         # Source will always be at the center of the data
+        fmodel = Model(gaussian_kernel, independent_vars=("X"))
 
         # decide whether to search around or not
         self.fit_success = False
         if search:
             logger.info("Fitting for position as well as the flux")
             # Fit it using lmfit
-            fmodel = Model(gaussian_kernel, independent_vars=("X"))
 
             params = self.make_params(data=sub_data, center=center)
 
