@@ -25,6 +25,6 @@ to find sources. It will look for point sources in the images.
 This code is not intended to be used as a scaled Selvay/Pybdsf. It 
 is not extremely optimized between speed and source searching.
 It can robustly fit for sources but is not scalable to all the
-survey images. And it can Currently it can fit only for point 
+survey images. And it can currently fit only for point 
 sources.
 
