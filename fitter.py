@@ -40,7 +40,7 @@ class fitter:
             wcs (astropy.wcs.wcs.WCS): WCS object of the image
             meta (astropy.io.fits.header.Header): header of the image
             coords (astropy.coordinates.sky_coordinate.SkyCoord): source coordinates
-            search (bool, Optional): Do a force fit or fit for position? Defaults to 
+            search (bool, Optional): Do a force fit or fit for position? Defaults to
                 True, to search for position.
         """
 
@@ -113,7 +113,7 @@ class fitter:
         self.bmaj_pix = abs(hdr["BMAJ"]) / self.pix_scl1
         self.bmin_pix = abs(hdr["BMIN"]) / self.pix_scl2
 
-        self.pos_ang = hdr["BPA"] % 180
+        self.pos_ang = 90 + hdr["BPA"] % 180
 
     def get_rms_from_image(self):
         # Calculate errors from the image itself
@@ -209,18 +209,18 @@ class fitter:
     def revise_params(self, fit, errs=None):
         """Helper function to revise the fit."""
         p0 = fit
-        #if errs is None:
+        # if errs is None:
         sx = self.bmaj_pix / fwhm_to_sig
         sy = self.bmin_pix / fwhm_to_sig
         pa = self.pos_ang
         errs = np.array([0.5, sx, sy, np.sqrt(sx), np.sqrt(sy), pa])
 
         params = create_params(
-            A=dict(value=p0[0], min=p0[0]/2, max=p0[0]*2),
+            A=dict(value=p0[0], min=p0[0] / 2, max=p0[0] * 2),
             x0=dict(value=p0[1], min=p0[1] - 2 * errs[1], max=p0[1] + 2 * errs[1]),
             y0=dict(value=p0[2], min=p0[2] - 2 * errs[2], max=p0[2] + 2 * errs[2]),
-            sx=dict(value=sx, min=0.5*sx, max=1.5*sx),
-            sy=dict(value=sy, min=0.5*sy, max=1.5*sy),
+            sx=dict(value=sx, min=0.5 * sx, max=1.5 * sx),
+            sy=dict(value=sy, min=0.5 * sy, max=1.5 * sy),
             pa=dict(value=p0[5], min=p0[5] - 2 * errs[5], max=p0[5] + 2 * errs[5]),
         )
         return params
